@@ -1,0 +1,23 @@
+{
+  "name": "v1-agent-watcher",
+  "version": "0.1.0",
+  "description": "Inspect live Codex V1 child-agent rollouts so a parent agent can supervise local subagents.",
+  "author": {
+    "name": "omni-"
+  },
+  "homepage": "https://github.com/omni-/V1AgentWatcher",
+  "repository": "https://github.com/omni-/V1AgentWatcher",
+  "keywords": ["codex", "subagent", "multi-agent", "supervision", "rollout"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "V1 Agent Watcher",
+    "shortDescription": "Inspect live V1 subagent progress",
+    "longDescription": "Lets a Codex parent inspect recent reasoning and tool activity persisted by V1 child-agent rollout sessions, making it possible to detect loops and steer delegated local workers.",
+    "developerName": "omni-",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read"],
+    "websiteURL": "https://github.com/omni-/V1AgentWatcher",
+    "defaultPrompt": ["Inspect my currently running V1 subagent and tell me whether it needs guidance."]
+  }
+}
