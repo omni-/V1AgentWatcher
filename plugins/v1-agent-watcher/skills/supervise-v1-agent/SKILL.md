@@ -11,6 +11,19 @@ When supervising a single recent worker, call `inspect_latest_v1_agent` with the
 
 Treat the watcher output as a recent progress window, not a complete transcript. Look for repeated reasoning, repeated searches, an invalid technical premise, no concrete progress, or a long interval since activity.
 
+## Cadence
+
+Local workers can be much slower than hosted models. Do not poll them on a generic short interval.
+
+- For an `ornith` worker, wait about **2 minutes** between healthy progress inspections.
+- For a `qwen` worker, wait about **4 minutes** between healthy progress inspections.
+- If the child finishes earlier, review it immediately rather than waiting out the interval.
+- After an inspection shows healthy forward progress, wait the full model-specific interval again before inspecting.
+- A long reasoning pause from a local model is not, by itself, evidence that it is stuck.
+- Inspect sooner only when there is concrete evidence of failure, interruption, or a tool/action that requires immediate attention.
+
+Prefer using the native V1 `wait_agent` timeout for these waits when practical so completion can wake the parent early. Do not repeatedly call the watcher while simply waiting for the next cadence boundary.
+
 If the child needs ordinary technical guidance, send one concise correction through Codex collaboration input with `interrupt=false` (or omit the interrupt flag when that means queued input). The correction should be queued for the running V1 child rather than aborting its active turn. Prefer a factual constraint or concrete next action over a long replanning prompt. Continue monitoring only when useful to confirm the worker incorporated the correction.
 
 Do **not** use `interrupt=true` for normal supervision or technical corrections. In V1, interruption aborts the active child turn and can leave external-provider workers stopped instead of resumed. Reserve `interrupt=true` for cases where cancellation of the current turn is explicitly intended, such as abandoning an irrecoverably stuck worker. If a child must be abandoned, close it and create a replacement with the corrected premise in its initial task rather than expecting an interrupted turn to resume.
