@@ -8,8 +8,12 @@ import {
   inspectAgentSession,
   listAgentSessions,
 } from './watcher.mjs';
+import {
+  inspectSupervisionUsage,
+  inspectThreadUsage,
+} from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.3.0' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.4.0' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -72,6 +76,31 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'inspect_v1_agent_usage',
+    description: 'Read compact post-hoc token accounting for one exact persisted Codex rollout. Uses the latest cumulative token_count snapshot, or exact raw response deltas when cumulative usage is absent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: { type: 'string', description: 'Exact Codex thread ID.' },
+      },
+      required: ['thread_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'inspect_v1_supervision_usage',
+    description: 'Summarize persisted Sol benchmark-turn, Qwen worker-lifetime, and Luna watchdog-lifetime token usage for an exact V1 worker tree. Prefer the v1usage CLI after completion to avoid adding a Sol observer turn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        worker_thread_id: { type: 'string', description: 'Exact Qwen worker thread ID.' },
+        watchdog_thread_id: { type: 'string', description: 'Optional exact Luna watchdog thread ID. Automatic discovery never guesses among ambiguous siblings.' },
+      },
+      required: ['worker_thread_id'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function send(message) {
@@ -80,6 +109,13 @@ function send(message) {
 
 function resultText(text) {
   return { content: [{ type: 'text', text }] };
+}
+
+function resultJson(value) {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(value) }],
+    structuredContent: value,
+  };
 }
 
 function rpcError(id, code, message) {
@@ -134,6 +170,18 @@ async function callTool(name, args = {}) {
         textLimit: args.text_limit,
       });
       return resultText(formatInspection(result));
+    }
+    case 'inspect_v1_agent_usage': {
+      const result = await inspectThreadUsage({ threadId: args.thread_id });
+      if (!result) return { ...resultText(`Thread not found: ${args.thread_id}`), isError: true };
+      return resultJson(result);
+    }
+    case 'inspect_v1_supervision_usage': {
+      const result = await inspectSupervisionUsage({
+        workerThreadId: args.worker_thread_id,
+        watchdogThreadId: args.watchdog_thread_id,
+      });
+      return resultJson(result);
     }
     default:
       return { ...resultText(`Unknown tool: ${name}`), isError: true };

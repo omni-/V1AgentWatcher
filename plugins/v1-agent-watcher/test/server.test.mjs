@@ -23,6 +23,23 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
       },
     },
     { timestamp: '2026-08-20T08:00:01Z', type: 'event_msg', payload: { type: 'task_started' } },
+    {
+      timestamp: '2026-08-20T08:00:02Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: 100, cached_input_tokens: 40, cache_write_input_tokens: 0,
+            output_tokens: 20, reasoning_output_tokens: 10, total_tokens: 120,
+          },
+          last_token_usage: {
+            input_tokens: 100, cached_input_tokens: 40, cache_write_input_tokens: 0,
+            output_tokens: 20, reasoning_output_tokens: 10, total_tokens: 120,
+          },
+          model_context_window: 258400,
+        },
+        rate_limits: null,
+      },
+    },
   ];
   await fs.writeFile(
     path.join(sessions, 'rollout-qwen.jsonl'),
@@ -58,6 +75,8 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
+  assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_usage'));
+  assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_supervision_usage'));
 
   const inspected = await rpc(3, 'tools/call', {
     name: 'inspect_v1_agent_health',
@@ -69,4 +88,14 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(health.state, 'running');
   assert.equal(health.health, 'healthy');
   assert.equal('events' in health, false);
+
+  const usage = await rpc(4, 'tools/call', {
+    name: 'inspect_v1_agent_usage',
+    arguments: { thread_id: 'qwen-thread' },
+  });
+  assert.equal(usage.result.isError, undefined);
+  const accounting = JSON.parse(usage.result.content[0].text);
+  assert.equal(accounting.thread, 'qwen-thread');
+  assert.equal(accounting.cumulative.effective_tokens, 80);
+  assert.equal(usage.result.structuredContent.thread, 'qwen-thread');
 });

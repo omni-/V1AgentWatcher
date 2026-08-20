@@ -1,13 +1,14 @@
 {
   "name": "v1-agent-watcher",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "bin": {
-    "v1watch": "./bin/v1watch.mjs"
+    "v1watch": "./bin/v1watch.mjs",
+    "v1usage": "./bin/v1usage.mjs"
   },
   "scripts": {
     "test": "node --test"

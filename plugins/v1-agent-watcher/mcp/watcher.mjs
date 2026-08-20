@@ -23,6 +23,15 @@ function normalizePath(value) {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
+function sessionMatchesOptions(session, options) {
+  if (options.threadId && session.threadId !== options.threadId) return false;
+  if (options.collaborationChildrenOnly && (!session.parentThreadId || !session.isCollabChild)) return false;
+  if (options.cwd && normalizePath(session.cwd) !== normalizePath(options.cwd)) return false;
+  if (options.provider && session.modelProvider?.toLowerCase() !== options.provider.toLowerCase()) return false;
+  if (options.parentThreadId && session.parentThreadId !== options.parentThreadId) return false;
+  return true;
+}
+
 async function collectRolloutFiles(root, maxFiles = DEFAULT_MAX_FILES) {
   const files = [];
 
@@ -43,6 +52,36 @@ async function collectRolloutFiles(root, maxFiles = DEFAULT_MAX_FILES) {
       if (entry.isDirectory()) {
         await walk(full);
       } else if (entry.isFile() && entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
+        files.push(full);
+      }
+    }
+  }
+
+  await walk(root);
+  return files;
+}
+
+async function collectExactRolloutFiles(root, threadId) {
+  const files = [];
+  const suffix = `-${threadId}.jsonl`.toLowerCase();
+
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'EACCES' || error?.code === 'EPERM') return;
+      throw error;
+    }
+
+    entries.sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()
+        && entry.name.startsWith('rollout-')
+        && entry.name.toLowerCase().endsWith(suffix)) {
         files.push(full);
       }
     }
@@ -202,16 +241,12 @@ function parseSessionMetaLine(line, filePath, stat) {
   };
 }
 
-export async function listAgentSessions(options = {}) {
+export async function listRolloutSessions(options = {}) {
   const codexHome = options.codexHome ? path.resolve(options.codexHome) : getCodexHome();
   const sessionsRoot = path.join(codexHome, 'sessions');
   const maxFiles = clampInt(options.maxFiles, 1, 20000, DEFAULT_MAX_FILES);
-  const maximumLimit = options.allowLargeLimit ? 20000 : 100;
+  const maximumLimit = options.allowLargeLimit || options.threadId ? 20000 : 100;
   const limit = clampInt(options.limit, 1, maximumLimit, DEFAULT_LIST_LIMIT);
-  const wantedCwd = normalizePath(options.cwd);
-  const wantedProvider = options.provider?.toLowerCase() ?? null;
-  const wantedParent = options.parentThreadId ?? null;
-
   const files = await collectRolloutFiles(sessionsRoot, maxFiles);
   const withStats = await Promise.all(files.map(async (filePath) => {
     try {
@@ -227,7 +262,7 @@ export async function listAgentSessions(options = {}) {
     return String(b?.filePath ?? '').localeCompare(String(a?.filePath ?? ''), undefined, { numeric: true });
   });
 
-  const agents = [];
+  const sessions = [];
   for (const item of withStats) {
     if (!item) continue;
     let firstLine;
@@ -237,15 +272,46 @@ export async function listAgentSessions(options = {}) {
       continue;
     }
     const meta = parseSessionMetaLine(firstLine, item.filePath, item.stat);
-    if (!meta?.parentThreadId || !meta.isCollabChild) continue;
-    if (wantedCwd && normalizePath(meta.cwd) !== wantedCwd) continue;
-    if (wantedProvider && meta.modelProvider?.toLowerCase() !== wantedProvider) continue;
-    if (wantedParent && meta.parentThreadId !== wantedParent) continue;
-    agents.push(meta);
-    if (agents.length >= limit) break;
+    if (!meta?.threadId) continue;
+    if (!sessionMatchesOptions(meta, options)) continue;
+    sessions.push(meta);
+    if (sessions.length >= limit) break;
   }
 
-  return agents;
+  return sessions;
+}
+
+export async function findRolloutSession(options = {}) {
+  if (!options.threadId) return null;
+  const codexHome = options.codexHome ? path.resolve(options.codexHome) : getCodexHome();
+  const exactFiles = await collectExactRolloutFiles(path.join(codexHome, 'sessions'), options.threadId);
+  const exactSessions = (await Promise.all(exactFiles.map(async (filePath) => {
+    try {
+      const stat = await fs.stat(filePath);
+      return parseSessionMetaLine(await readFirstLine(filePath), filePath, stat);
+    } catch {
+      return null;
+    }
+  })))
+    .filter((session) => session && sessionMatchesOptions(session, options))
+    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+  if (exactSessions.length) return exactSessions[0];
+
+  const sessions = await listRolloutSessions({
+    ...options,
+    codexHome,
+    maxFiles: options.maxFiles ?? 20000,
+    limit: 1,
+    allowLargeLimit: true,
+  });
+  return sessions[0] ?? null;
+}
+
+export async function listAgentSessions(options = {}) {
+  return listRolloutSessions({
+    ...options,
+    collaborationChildrenOnly: true,
+  });
 }
 
 function clampInt(value, min, max, fallback) {
