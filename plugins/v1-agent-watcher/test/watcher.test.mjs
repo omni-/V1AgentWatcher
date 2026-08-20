@@ -21,22 +21,31 @@ async function makeRollout(root, name, meta, lines = []) {
   return file;
 }
 
-test('lists only child rollouts and filters provider/cwd', async (t) => {
+test('lists only collaboration child rollouts and filters provider/cwd', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'v1-agent-watcher-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
 
   await makeRollout(root, 'rollout-root.jsonl', {
     id: 'root', parent_thread_id: null, cwd: 'C:\\repo', model_provider: 'openai',
   });
+  await makeRollout(root, 'rollout-internal.jsonl', {
+    id: 'internal', parent_thread_id: 'root', cwd: 'C:\\repo', model_provider: 'openai',
+    multi_agent_version: 'disabled', source: { internal: 'guardian' },
+  });
   await makeRollout(root, 'rollout-child.jsonl', {
     id: 'child', parent_thread_id: 'root', cwd: 'C:\\repo', model_provider: 'lmstudio',
     agent_nickname: 'ornith', multi_agent_version: 'v1',
+    source: { sub_agent: { thread_spawn: { parent_thread_id: 'root' } } },
   });
 
-  const agents = await listAgentSessions({ codexHome: root, provider: 'lmstudio' });
+  const agents = await listAgentSessions({ codexHome: root });
   assert.equal(agents.length, 1);
   assert.equal(agents[0].threadId, 'child');
   assert.equal(agents[0].agentNickname, 'ornith');
+
+  const localAgents = await listAgentSessions({ codexHome: root, provider: 'lmstudio' });
+  assert.equal(localAgents.length, 1);
+  assert.equal(localAgents[0].threadId, 'child');
 });
 
 test('extracts reasoning and tool activity and de-duplicates adjacent copies', () => {
@@ -54,15 +63,40 @@ test('extracts reasoning and tool activity and de-duplicates adjacent copies', (
   assert.match(summary.events.find((event) => event.kind === 'tool_call').text, /rg incSeason/);
 });
 
-test('inspects latest child session', async (t) => {
+test('extracts and coalesces raw reasoning delta events', () => {
+  const lines = [
+    JSON.stringify({ timestamp: 't1', type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ timestamp: 't2', type: 'event_msg', payload: { type: 'reasoning_raw_content_delta', item_id: 'reason-1', delta: 'The race ' } }),
+    JSON.stringify({ timestamp: 't3', type: 'event_msg', payload: { type: 'reasoning_raw_content_delta', item_id: 'reason-1', delta: 'can interleave across await.' } }),
+  ];
+
+  const summary = summarizeRolloutLines(lines, { eventLimit: 10 });
+  assert.equal(summary.status, 'running');
+  const reasoning = summary.events.find((event) => event.kind === 'reasoning');
+  assert.ok(reasoning);
+  assert.match(reasoning.text, /The race can interleave across await/);
+});
+
+test('recognizes v1 task lifecycle event names', () => {
+  const lines = [
+    JSON.stringify({ timestamp: 't1', type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ timestamp: 't2', type: 'event_msg', payload: { type: 'task_complete' } }),
+  ];
+
+  const summary = summarizeRolloutLines(lines, { eventLimit: 10 });
+  assert.equal(summary.status, 'idle');
+});
+
+test('inspects latest collaboration child session', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'v1-agent-watcher-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
 
   await makeRollout(root, 'rollout-child.jsonl', {
     id: 'child', parent_thread_id: 'root', cwd: 'C:\\repo', model_provider: 'lmstudio',
     agent_path: '/root/worker', multi_agent_version: 'v1',
+    source: { sub_agent: { thread_spawn: { parent_thread_id: 'root' } } },
   }, [
-    { timestamp: '2026-08-20T08:00:01Z', type: 'event_msg', payload: { type: 'turn_started' } },
+    { timestamp: '2026-08-20T08:00:01Z', type: 'event_msg', payload: { type: 'task_started' } },
     { timestamp: '2026-08-20T08:00:02Z', type: 'response_item', payload: { type: 'reasoning', content: [{ type: 'reasoning_text', text: 'I should build before finishing.' }], summary: [] } },
   ]);
 
