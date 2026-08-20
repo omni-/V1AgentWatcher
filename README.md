@@ -12,6 +12,38 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 
 The watcher intentionally returns only a short recent window and truncates individual events so supervision costs far fewer parent-model tokens than replaying the full rollout.
 
+## Live terminal viewer
+
+The plugin also includes `v1watch`, a human-facing live viewer for the same rollout data.
+
+```powershell
+v1watch
+```
+
+By default it follows the newest child agent and redraws a compact dashboard showing recent reasoning, assistant messages, tool activity, state, provider, cwd, and last-activity age.
+
+Useful modes:
+
+```powershell
+v1watch -Agent ornith
+v1watch -Provider lmstudio
+v1watch -Agent ornith -Stream
+v1watch -Raw
+v1watch -Once
+```
+
+`-Stream` appends new activity instead of redrawing the dashboard. `-Raw` tails the underlying rollout JSONL without summarization.
+
+To put `v1watch` on your PATH from a local checkout:
+
+```powershell
+git clone https://github.com/omni-/V1AgentWatcher.git
+cd V1AgentWatcher\plugins\v1-agent-watcher
+npm link
+```
+
+The CLI has no runtime dependencies beyond Node.js.
+
 ## Install in Codex
 
 Add this repository as a plugin marketplace, then install the plugin:
