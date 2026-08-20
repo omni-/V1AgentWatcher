@@ -72,6 +72,24 @@ async function readFirstLine(filePath, maxBytes = 4 * 1024 * 1024) {
   }
 }
 
+function sourceLooksLikeSubagent(source) {
+  if (source === null || source === undefined) return false;
+  let text;
+  try {
+    text = typeof source === 'string' ? source : JSON.stringify(source);
+  } catch {
+    return false;
+  }
+  return /sub.?agent|thread.?spawn/i.test(text);
+}
+
+function isCollabChild(meta) {
+  const hasAgentIdentity = Boolean(meta.agent_path || meta.agent_nickname || meta.agent_role);
+  const version = String(meta.multi_agent_version ?? '').toLowerCase();
+  const activeMultiAgent = Boolean(version) && version !== 'disabled';
+  return sourceLooksLikeSubagent(meta.source ?? meta.session_source) || (hasAgentIdentity && activeMultiAgent);
+}
+
 function parseSessionMetaLine(line, filePath, stat) {
   let record;
   try {
@@ -95,6 +113,8 @@ function parseSessionMetaLine(line, filePath, stat) {
     agentRole: meta.agent_role ?? null,
     modelProvider: meta.model_provider ?? null,
     multiAgentVersion: meta.multi_agent_version ?? null,
+    sessionSource: meta.source ?? meta.session_source ?? null,
+    isCollabChild: isCollabChild(meta),
     createdAt: meta.timestamp ?? record.timestamp ?? null,
     updatedAt: stat.mtime.toISOString(),
     updatedAtMs: stat.mtimeMs,
@@ -132,7 +152,7 @@ export async function listAgentSessions(options = {}) {
       continue;
     }
     const meta = parseSessionMetaLine(firstLine, item.filePath, item.stat);
-    if (!meta?.parentThreadId) continue;
+    if (!meta?.parentThreadId || !meta.isCollabChild) continue;
     if (wantedCwd && normalizePath(meta.cwd) !== wantedCwd) continue;
     if (wantedProvider && meta.modelProvider?.toLowerCase() !== wantedProvider) continue;
     if (wantedParent && meta.parentThreadId !== wantedParent) continue;
@@ -150,11 +170,20 @@ function clampInt(value, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.trunc(number)));
 }
 
+function normalizeText(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
 function truncate(text, max = DEFAULT_TEXT_LIMIT) {
-  if (text === null || text === undefined) return '';
-  const normalized = String(text).replace(/\s+/g, ' ').trim();
+  const normalized = normalizeText(text);
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 1)}…`;
+}
+
+function truncateTail(text, max = DEFAULT_TEXT_LIMIT) {
+  const normalized = normalizeText(text);
+  if (normalized.length <= max) return normalized;
+  return `…${normalized.slice(-(max - 1))}`;
 }
 
 function textBlocks(content) {
@@ -173,7 +202,7 @@ function summarizeResponseItem(record, textLimit) {
         ? payload.summary.map((part) => part?.text).filter(Boolean)
         : [];
       const content = textBlocks(payload.content);
-      const text = summary.length ? summary.join(' ') : content.join(' ');
+      const text = content.length ? content.join(' ') : summary.join(' ');
       return text ? { kind: 'reasoning', text: truncate(text, textLimit) } : null;
     }
     case 'message': {
@@ -201,17 +230,41 @@ function summarizeResponseItem(record, textLimit) {
   }
 }
 
+function reasoningDelta(payload, prefix) {
+  if (!payload.delta) return null;
+  return {
+    kind: 'reasoning',
+    text: payload.delta,
+    append: true,
+    streamKey: `${prefix}:${payload.item_id ?? payload.turn_id ?? 'current'}`,
+  };
+}
+
 function summarizeEvent(record, textLimit) {
   const payload = record.payload ?? {};
   switch (payload.type) {
     case 'agent_reasoning':
       return payload.text ? { kind: 'reasoning', text: truncate(payload.text, textLimit) } : null;
+    case 'agent_reasoning_raw_content':
+      return payload.text ? { kind: 'reasoning', text: truncate(payload.text, textLimit), raw: true } : null;
+    case 'reasoning_raw_content_delta':
+      return reasoningDelta(payload, 'raw');
+    case 'reasoning_content_delta':
+      return reasoningDelta(payload, 'summary');
+    case 'task_started':
     case 'turn_started':
       return { kind: 'state', text: 'turn started' };
+    case 'task_complete':
     case 'turn_complete':
       return { kind: 'state', text: 'turn complete' };
     case 'turn_aborted':
       return { kind: 'state', text: `turn aborted${payload.reason ? `: ${truncate(payload.reason, 240)}` : ''}` };
+    case 'context_compacted':
+      return { kind: 'state', text: 'context compacted' };
+    case 'exec_command_begin': {
+      const command = Array.isArray(payload.command) ? payload.command.join(' ') : payload.command;
+      return command ? { kind: 'shell', text: truncate(command, Math.min(textLimit, 420)) } : null;
+    }
     default:
       return null;
   }
@@ -241,16 +294,29 @@ export function summarizeRolloutLines(lines, options = {}) {
     else if (record.type === 'event_msg') {
       event = summarizeEvent(record, textLimit);
       const type = record.payload?.type;
-      if (type === 'turn_started') status = 'running';
-      else if (type === 'turn_complete') status = 'idle';
+      if (type === 'task_started' || type === 'turn_started') status = 'running';
+      else if (type === 'task_complete' || type === 'turn_complete') status = 'idle';
       else if (type === 'turn_aborted') status = 'aborted';
     }
 
-    if (event) {
-      event.timestamp = record.timestamp ?? null;
+    if (!event) continue;
+    event.timestamp = record.timestamp ?? null;
+
+    if (event.append) {
       const previous = events.at(-1);
-      if (!previous || eventKey(previous) !== eventKey(event)) events.push(event);
+      if (previous?.append && previous.streamKey === event.streamKey) {
+        previous.rawText = `${previous.rawText ?? previous.text ?? ''}${event.text}`;
+        if (previous.rawText.length > textLimit * 8) previous.rawText = previous.rawText.slice(-(textLimit * 8));
+        previous.text = truncateTail(previous.rawText, textLimit);
+        previous.timestamp = event.timestamp;
+        continue;
+      }
+      event.rawText = event.text;
+      event.text = truncateTail(event.text, textLimit);
     }
+
+    const previous = events.at(-1);
+    if (!previous || eventKey(previous) !== eventKey(event)) events.push(event);
   }
 
   return { status, events: events.slice(-eventLimit) };
@@ -273,6 +339,7 @@ async function resolveAgent(options = {}) {
     const needle = options.nickname.toLowerCase();
     return agents.find((agent) =>
       agent.agentNickname?.toLowerCase() === needle ||
+      agent.agentRole?.toLowerCase() === needle ||
       agent.agentPath?.toLowerCase() === needle ||
       agent.agentPath?.toLowerCase().endsWith(`/${needle}`)
     ) ?? null;
@@ -301,9 +368,9 @@ export async function inspectAgentSession(options = {}) {
 }
 
 export function formatAgentList(agents) {
-  if (!agents.length) return 'No child-agent rollout sessions found.';
+  if (!agents.length) return 'No V1 collaboration child-agent rollout sessions found.';
   return agents.map((agent, index) => {
-    const label = agent.agentNickname ?? agent.agentPath ?? agent.threadId ?? '(unknown)';
+    const label = agent.agentNickname ?? agent.agentRole ?? agent.agentPath ?? agent.threadId ?? '(unknown)';
     const provider = agent.modelProvider ?? 'unknown-provider';
     const version = agent.multiAgentVersion ?? 'unknown-version';
     return `${index + 1}. ${label} | thread=${agent.threadId ?? '?'} | parent=${agent.parentThreadId ?? '?'} | ${provider} | ${version} | cwd=${agent.cwd ?? '?'} | updated=${agent.updatedAt}`;
@@ -311,9 +378,9 @@ export function formatAgentList(agents) {
 }
 
 export function formatInspection(result) {
-  if (!result) return 'No matching child-agent rollout session found.';
+  if (!result) return 'No matching V1 collaboration child-agent rollout session found.';
   const { agent } = result;
-  const label = agent.agentNickname ?? agent.agentPath ?? agent.threadId ?? '(unknown)';
+  const label = agent.agentNickname ?? agent.agentRole ?? agent.agentPath ?? agent.threadId ?? '(unknown)';
   const lines = [
     `agent: ${label}`,
     `thread: ${agent.threadId ?? '?'}`,
