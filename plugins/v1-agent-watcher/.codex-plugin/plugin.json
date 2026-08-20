@@ -1,7 +1,7 @@
 {
   "name": "v1-agent-watcher",
-  "version": "0.2.2",
-  "description": "Inspect live Codex V1 child-agent rollouts so a parent agent can supervise local subagents.",
+  "version": "0.3.0",
+  "description": "Supervise Codex V1 child agents with compact deterministic health checks and a persistent low-cost watchdog.",
   "author": {
     "name": "omni-"
   },
@@ -12,12 +12,12 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "V1 Agent Watcher",
-    "shortDescription": "Inspect live V1 subagent progress",
-    "longDescription": "Lets a Codex parent inspect recent reasoning and tool activity persisted by V1 child-agent rollout sessions, making it possible to detect loops and steer delegated local workers.",
+    "shortDescription": "Cheap health checks for V1 workers",
+    "longDescription": "Screens persisted V1 child-agent rollouts for observable loops and stalls, exposes detailed activity only on demand, and provides a persistent Luna-watchdog supervision workflow.",
     "developerName": "omni-",
     "category": "Developer Tools",
     "capabilities": ["Interactive", "Read"],
     "websiteURL": "https://github.com/omni-/V1AgentWatcher",
-    "defaultPrompt": ["Inspect my currently running V1 subagent and tell me whether it needs guidance."]
+    "defaultPrompt": ["Supervise my running V1 worker cheaply with a persistent Luna watchdog."]
   }
 }
