@@ -1,0 +1,21 @@
+{
+  "name": "v1-agent-watcher",
+  "interface": {
+    "displayName": "V1 Agent Watcher"
+  },
+  "plugins": [
+    {
+      "name": "v1-agent-watcher",
+      "source": {
+        "source": "local",
+        "path": "./plugins/v1-agent-watcher"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL",
+        "products": ["CODEX"]
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
