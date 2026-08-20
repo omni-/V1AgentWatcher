@@ -9,6 +9,7 @@ import {
   inspectAgentSession,
   listAgentSessions,
   summarizeRolloutLines,
+  waitForAgent,
 } from '../mcp/watcher.mjs';
 
 function v1ChildMeta(overrides = {}) {
@@ -134,6 +135,73 @@ test('exact thread lookup is not limited to the newest 100 child sessions', asyn
   assert.equal(result.agent.threadId, 'child-0');
 });
 
+test('exact thread lookup is not rejected by stale metadata hints', async (t) => {
+  const root = await temporaryCodexHome(t);
+  await makeRollout(root, 'rollout-worker.jsonl', v1ChildMeta({
+    id: 'worker', cwd: 'C:\\persisted-parent-cwd', model_provider: 'lmstudio',
+  }), [
+    { type: 'event_msg', payload: { type: 'task_started' } },
+  ]);
+
+  const result = await inspectAgentHealth({
+    codexHome: root,
+    threadId: 'worker',
+    cwd: 'C:\\worker-shell-cwd',
+    provider: 'expected-provider-hint',
+    parentThreadId: 'expected-parent-hint',
+  });
+  assert.equal(result.agent.threadId, 'worker');
+  assert.equal(result.state, 'running');
+});
+
+test('persisted-rollout wait wakes when an exact sibling worker completes', async (t) => {
+  const root = await temporaryCodexHome(t);
+  const file = await makeRollout(root, 'rollout-worker.jsonl', v1ChildMeta({ id: 'worker' }), [
+    { type: 'event_msg', payload: { type: 'task_started' } },
+  ]);
+  const appendCompletion = (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await fs.appendFile(file, `${JSON.stringify({
+      type: 'event_msg', payload: { type: 'task_complete' },
+    })}\n`, 'utf8');
+  })();
+
+  const result = await waitForAgent({
+    codexHome: root,
+    threadId: 'worker',
+    timeoutMs: 500,
+    pollIntervalMs: 5,
+  });
+  await appendCompletion;
+  assert.equal(result.outcome, 'completed');
+  assert.equal(result.threadId, 'worker');
+  assert.equal(result.found, true);
+});
+
+test('persisted-rollout wait times out without treating a missing session as terminal', async (t) => {
+  const root = await temporaryCodexHome(t);
+  const result = await waitForAgent({
+    codexHome: root,
+    threadId: 'not-persisted-yet',
+    timeoutMs: 25,
+    pollIntervalMs: 5,
+  });
+  assert.equal(result.outcome, 'timeout');
+  assert.equal(result.state, 'missing');
+  assert.equal(result.found, false);
+});
+
+test('persisted-rollout wait reports worker terminal errors immediately', async (t) => {
+  const root = await temporaryCodexHome(t);
+  await makeRollout(root, 'rollout-worker.jsonl', v1ChildMeta({ id: 'worker' }), [
+    { type: 'event_msg', payload: { type: 'task_started' } },
+    { type: 'event_msg', payload: { type: 'error', message: 'provider failed' } },
+  ]);
+  const result = await waitForAgent({ codexHome: root, threadId: 'worker', timeoutMs: 100 });
+  assert.equal(result.outcome, 'terminal_error');
+  assert.equal(result.state, 'errored');
+});
+
 test('maxFiles scanning starts with the newest date directories', async (t) => {
   const root = await temporaryCodexHome(t);
   await makeRollout(root, 'rollout-old.jsonl', v1ChildMeta({ id: 'old' }), [], ['2025', '01', '01']);
@@ -249,11 +317,21 @@ test('one self-correction and Qwen slowness alone remain healthy', () => {
 
   const health = analyzeAgentHealth(lines, {
     agent: { agentNickname: 'qwen' },
-    secondsSinceActivity: 20 * 60,
+    secondsSinceActivity: 59 * 60,
   });
   assert.equal(health.state, 'running');
   assert.equal(health.health, 'healthy');
   assert.deepEqual(health.signals, []);
+});
+
+test('Qwen inactivity becomes suspicious only after one hour', () => {
+  const lines = [JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } })];
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 60 * 60,
+  });
+  assert.equal(health.health, 'suspicious');
+  assert.ok(health.signals.some((signal) => signal.startsWith('inactivity:')));
 });
 
 test('repeated premise reversals can trigger suspicion', () => {

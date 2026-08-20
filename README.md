@@ -7,6 +7,7 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 ## Tools
 
 - `list_v1_agents` — list recent child rollout sessions and their thread/parent/provider metadata.
+- `wait_v1_agent` — wait on one exact persisted rollout until terminal state or timeout, without native parent/child wait ownership.
 - `inspect_v1_agent_health` — run a compact deterministic behavioral screen for one exact V1 worker thread without returning its detailed trace.
 - `inspect_v1_agent` — inspect recent reasoning, assistant messages, and tool activity for a specific child.
 - `inspect_latest_v1_agent` — convenience tool for supervising the most recently active child, optionally filtered by cwd/provider.
@@ -16,7 +17,7 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 
 The watcher intentionally returns only a short recent window and truncates individual events so supervision costs far fewer parent-model tokens than replaying the full rollout.
 
-The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated premise reversals, repeated compaction, terminal errors, and conservative inactivity. One self-correction and ordinary Qwen latency are not suspicious by themselves.
+The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated premise reversals, repeated compaction, terminal errors, and conservative inactivity. One self-correction and up to an hour without persisted Qwen activity are not suspicious by themselves.
 
 ## Cheap watchdog supervision
 
@@ -28,9 +29,9 @@ Sol
  └─ Luna: wait on Qwen, run compact health checks, stay silent while healthy
 ```
 
-Luna waits about four minutes between healthy Qwen checks (two minutes for Ornith), using Codex's native agent wait so worker completion wakes it early. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`. Sol waits on Luna and does not inspect Qwen's trace during healthy intervals.
+Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`. Sol waits on Luna and does not inspect Qwen's trace during healthy intervals.
 
-The watchdog always uses the worker's exact thread ID. Once Luna is running, it may be the newest child session, so `inspect_latest_v1_agent` is not safe for the worker in this flow.
+The watchdog always uses the worker's exact thread ID. Provider and persisted cwd are informational and are not used as identity filters because rollout metadata can retain the parent launch cwd. Once Luna is running, it may be the newest child session, so `inspect_latest_v1_agent` is not safe for the worker in this flow.
 
 ## Post-hoc token accounting
 

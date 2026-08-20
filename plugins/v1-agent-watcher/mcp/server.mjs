@@ -7,13 +7,14 @@ import {
   inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
+  waitForAgent,
 } from './watcher.mjs';
 import {
   inspectSupervisionUsage,
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.4.0' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.5.0' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -30,6 +31,19 @@ const TOOLS = [
     },
   },
   {
+    name: 'wait_v1_agent',
+    description: 'Wait for one exact persisted V1 worker to complete, abort, error, or reach a timeout. This is sibling-safe and does not depend on native Codex parent/child wait ownership or cwd/provider metadata.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: { type: 'string', description: 'Exact worker thread ID.' },
+        timeout_ms: { type: 'integer', minimum: 1, maximum: 3600000, default: 900000 },
+      },
+      required: ['thread_id'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'inspect_v1_agent_health',
     description: 'Run a small deterministic behavioral health screen for one V1 collaboration child. Detects observable looping, repeated failures/backtracking, repeated compaction, and conservative inactivity; it does not judge engineering correctness or return the detailed trace.',
     inputSchema: {
@@ -37,9 +51,9 @@ const TOOLS = [
       properties: {
         thread_id: { type: 'string', description: 'Exact worker thread id. Strongly preferred for watchdog supervision.' },
         nickname: { type: 'string', description: 'Exact agent nickname, role, or agent path. Used only when thread_id is omitted.' },
-        cwd: { type: 'string', description: 'Optional exact project cwd filter.' },
-        provider: { type: 'string', description: 'Optional provider filter, for example lmstudio.' },
-        parent_thread_id: { type: 'string', description: 'Optional parent thread filter.' },
+        cwd: { type: 'string', description: 'Optional discovery filter; ignored when thread_id is supplied.' },
+        provider: { type: 'string', description: 'Optional discovery filter; ignored when thread_id is supplied.' },
+        parent_thread_id: { type: 'string', description: 'Optional discovery filter; ignored when thread_id is supplied.' },
       },
       additionalProperties: false,
     },
@@ -52,9 +66,9 @@ const TOOLS = [
       properties: {
         thread_id: { type: 'string', description: 'Exact child thread id. Preferred when known.' },
         nickname: { type: 'string', description: 'Agent nickname or agent path. Used when thread_id is omitted.' },
-        cwd: { type: 'string', description: 'Optional exact project cwd filter.' },
-        provider: { type: 'string', description: 'Optional provider filter, for example lmstudio.' },
-        parent_thread_id: { type: 'string', description: 'Optional parent thread filter.' },
+        cwd: { type: 'string', description: 'Optional discovery filter; ignored when thread_id is supplied.' },
+        provider: { type: 'string', description: 'Optional discovery filter; ignored when thread_id is supplied.' },
+        parent_thread_id: { type: 'string', description: 'Optional discovery filter; ignored when thread_id is supplied.' },
         event_limit: { type: 'integer', minimum: 1, maximum: 100, default: 16 },
         text_limit: { type: 'integer', minimum: 80, maximum: 4000, default: 700 },
       },
@@ -147,6 +161,13 @@ async function callTool(name, args = {}) {
         textLimit: args.text_limit,
       });
       return resultText(formatInspection(result));
+    }
+    case 'wait_v1_agent': {
+      const result = await waitForAgent({
+        threadId: args.thread_id,
+        timeoutMs: args.timeout_ms,
+      });
+      return resultJson(result);
     }
     case 'inspect_v1_agent_health': {
       if (!args.thread_id && !args.nickname) {

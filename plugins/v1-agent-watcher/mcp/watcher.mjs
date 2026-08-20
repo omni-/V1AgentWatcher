@@ -10,6 +10,8 @@ const DEFAULT_READ_BYTES = 8 * 1024 * 1024;
 const MAX_READ_CACHE_ENTRIES = 8;
 const HEALTH_EVENT_LIMIT = 100;
 const HEALTH_TEXT_LIMIT = 1200;
+const DEFAULT_WAIT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_WAIT_POLL_INTERVAL_MS = 5000;
 
 const recentRolloutCache = new Map();
 
@@ -703,7 +705,7 @@ function inactivityThreshold(agent) {
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
-  if (identity.includes('qwen')) return 30 * 60;
+  if (identity.includes('qwen')) return 60 * 60;
   if (identity.includes('ornith')) return 10 * 60;
   return 15 * 60;
 }
@@ -782,9 +784,12 @@ async function resolveAgent(options = {}) {
   const exactThreadLookup = Boolean(options.threadId);
   const agents = await listAgentSessions({
     codexHome: options.codexHome,
-    cwd: options.cwd,
-    provider: options.provider,
-    parentThreadId: options.parentThreadId,
+    // An exact thread ID is authoritative. Persisted cwd/provider metadata can
+    // describe the parent launch context rather than the worker's shell state,
+    // so optional discovery hints must not hide an otherwise exact match.
+    cwd: exactThreadLookup ? undefined : options.cwd,
+    provider: exactThreadLookup ? undefined : options.provider,
+    parentThreadId: exactThreadLookup ? undefined : options.parentThreadId,
     limit: exactThreadLookup ? 20000 : 100,
     allowLargeLimit: exactThreadLookup,
     maxFiles: options.maxFiles,
@@ -836,10 +841,7 @@ export async function inspectAgentSession(options = {}) {
   };
 }
 
-export async function inspectAgentHealth(options = {}) {
-  const agent = await resolveAgent(options);
-  if (!agent) return null;
-
+async function inspectResolvedAgentHealth(agent, options = {}) {
   let recent;
   try {
     recent = await readRecentRollout(agent.filePath, options.maxReadBytes);
@@ -875,6 +877,77 @@ export async function inspectAgentHealth(options = {}) {
   recent.entry.status = analysis.state;
 
   return { agent: currentAgent, secondsSinceActivity, ...analysis };
+}
+
+export async function inspectAgentHealth(options = {}) {
+  const agent = await resolveAgent(options);
+  return agent ? inspectResolvedAgentHealth(agent, options) : null;
+}
+
+function waitDelay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function waitForAgent(options = {}) {
+  if (!options.threadId) throw new Error('threadId is required');
+
+  const timeoutMs = clampInt(options.timeoutMs, 1, 3_600_000, DEFAULT_WAIT_TIMEOUT_MS);
+  const pollIntervalMs = clampInt(
+    options.pollIntervalMs,
+    1,
+    60_000,
+    DEFAULT_WAIT_POLL_INTERVAL_MS,
+  );
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let lastHealth = null;
+  let agent = null;
+  let found = false;
+
+  while (true) {
+    // Exact ID is the complete identity here. This wait deliberately does not
+    // depend on Codex parent/child ownership or persisted cwd/provider hints.
+    agent ??= await resolveAgent({ codexHome: options.codexHome, threadId: options.threadId });
+    lastHealth = agent
+      ? await inspectResolvedAgentHealth(agent, { maxReadBytes: options.maxReadBytes })
+      : null;
+    found ||= Boolean(lastHealth);
+
+    if (lastHealth?.state === 'idle') {
+      return {
+        outcome: 'completed',
+        threadId: options.threadId,
+        found: true,
+        state: lastHealth.state,
+        health: lastHealth.health,
+        waitedMs: Date.now() - startedAt,
+      };
+    }
+    if (lastHealth?.state === 'aborted' || lastHealth?.state === 'errored') {
+      return {
+        outcome: 'terminal_error',
+        threadId: options.threadId,
+        found: true,
+        state: lastHealth.state,
+        health: lastHealth.health,
+        signals: lastHealth.signals,
+        waitedMs: Date.now() - startedAt,
+      };
+    }
+
+    const now = Date.now();
+    if (now >= deadline) {
+      return {
+        outcome: 'timeout',
+        threadId: options.threadId,
+        found,
+        state: lastHealth?.state ?? 'missing',
+        health: lastHealth?.health ?? null,
+        waitedMs: now - startedAt,
+      };
+    }
+    await waitDelay(Math.min(pollIntervalMs, deadline - now));
+  }
 }
 
 export function formatAgentList(agents) {
