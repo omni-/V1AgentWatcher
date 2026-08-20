@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "v1_agent_watcher": {
+      "command": "node",
+      "args": ["./mcp/server.mjs"],
+      "cwd": "."
+    }
+  }
+}
