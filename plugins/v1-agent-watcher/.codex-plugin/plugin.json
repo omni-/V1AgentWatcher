@@ -1,19 +1,19 @@
 {
   "name": "v1-agent-watcher",
-  "version": "0.3.0",
-  "description": "Supervise Codex V1 child agents with compact deterministic health checks and a persistent low-cost watchdog.",
+  "version": "0.4.0",
+  "description": "Supervise Codex V1 child agents and inspect exact post-hoc rollout token usage.",
   "author": {
     "name": "omni-"
   },
   "homepage": "https://github.com/omni-/V1AgentWatcher",
   "repository": "https://github.com/omni-/V1AgentWatcher",
-  "keywords": ["codex", "subagent", "multi-agent", "supervision", "rollout"],
+  "keywords": ["codex", "subagent", "multi-agent", "supervision", "rollout", "tokens", "benchmarking"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "V1 Agent Watcher",
-    "shortDescription": "Cheap health checks for V1 workers",
-    "longDescription": "Screens persisted V1 child-agent rollouts for observable loops and stalls, exposes detailed activity only on demand, and provides a persistent Luna-watchdog supervision workflow.",
+    "shortDescription": "V1 supervision and rollout usage",
+    "longDescription": "Screens persisted V1 child-agent rollouts for observable loops and stalls, provides a persistent Luna-watchdog supervision workflow, and reports exact-thread post-hoc token accounting for benchmarks.",
     "developerName": "omni-",
     "category": "Developer Tools",
     "capabilities": ["Interactive", "Read"],
