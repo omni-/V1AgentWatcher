@@ -7,10 +7,27 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 ## Tools
 
 - `list_v1_agents` — list recent child rollout sessions and their thread/parent/provider metadata.
+- `inspect_v1_agent_health` — run a compact deterministic behavioral screen for one exact V1 worker thread without returning its detailed trace.
 - `inspect_v1_agent` — inspect recent reasoning, assistant messages, and tool activity for a specific child.
 - `inspect_latest_v1_agent` — convenience tool for supervising the most recently active child, optionally filtered by cwd/provider.
 
 The watcher intentionally returns only a short recent window and truncates individual events so supervision costs far fewer parent-model tokens than replaying the full rollout.
+
+The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated premise reversals, repeated compaction, terminal errors, and conservative inactivity. One self-correction and ordinary Qwen latency are not suspicious by themselves.
+
+## Cheap watchdog supervision
+
+The bundled supervision skill uses a persistent Luna sibling as the watchdog:
+
+```text
+Sol
+ ├─ Qwen: real engineering task
+ └─ Luna: wait on Qwen, run compact health checks, stay silent while healthy
+```
+
+Luna waits about four minutes between healthy Qwen checks (two minutes for Ornith), using Codex's native agent wait so worker completion wakes it early. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`. Sol waits on Luna and does not inspect Qwen's trace during healthy intervals.
+
+The watchdog always uses the worker's exact thread ID. Once Luna is running, it may be the newest child session, so `inspect_latest_v1_agent` is not safe for the worker in this flow.
 
 ## Live terminal viewer
 
@@ -58,10 +75,10 @@ Restart Codex after installation. The bundled stdio MCP server uses only Node.js
 ## Typical parent prompt
 
 ```text
-Delegate the implementation to the `ornith` agent. While it is working, use
-V1 Agent Watcher occasionally to inspect its progress. If it is looping or
-following a clearly invalid premise, send one concise corrective message.
-After it finishes, review the diff yourself.
+Delegate the implementation to the `qwen` agent, retain its exact thread ID,
+and use the supervise-v1-agent skill to spawn one Luna watchdog for that ID.
+Wait on Luna. Do not inspect Qwen's trace while Luna reports no terminal result.
+After Luna returns DONE, review Qwen's diff yourself.
 ```
 
 ## Requirements

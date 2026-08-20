@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { promises as fs } from 'node:fs';
 import process from 'node:process';
 import {
   inspectAgentSession,
   listAgentSessions,
+  readRecentRolloutLines,
 } from '../mcp/watcher.mjs';
 
 const DEFAULT_INTERVAL_MS = 750;
@@ -178,13 +178,12 @@ function formatEvent(event, width) {
 }
 
 async function readRawTail(filePath, limit) {
-  let contents;
   try {
-    contents = await fs.readFile(filePath, 'utf8');
+    const lines = await readRecentRolloutLines(filePath, { maxBytes: 4 * 1024 * 1024 });
+    return lines.filter(Boolean).slice(-limit);
   } catch {
     return [];
   }
-  return contents.split(/\r?\n/).filter(Boolean).slice(-limit);
 }
 
 async function inspect(options) {
@@ -272,6 +271,7 @@ async function streamSnapshot(result, options, state) {
   if (state.threadId !== threadId) {
     state.threadId = threadId;
     state.seen.clear();
+    state.streamText.clear();
     process.stdout.write(`\n=== ${labelFor(result.agent)} | ${threadId} | ${result.agent.modelProvider ?? '?'} | ${result.agent.cwd ?? '?'} ===\n`);
   }
 
@@ -287,6 +287,16 @@ async function streamSnapshot(result, options, state) {
   }
 
   for (const event of result.events) {
+    if (event.append && event.streamKey) {
+      const streamKey = `${threadId}\u0000${event.streamKey}`;
+      const fullText = event.rawText ?? event.text;
+      const previousText = state.streamText.get(streamKey) ?? '';
+      if (fullText === previousText) continue;
+      const delta = fullText.startsWith(previousText) ? fullText.slice(previousText.length) : fullText;
+      state.streamText.set(streamKey, fullText);
+      if (delta) process.stdout.write(`${formatClock(event.timestamp)}  ${activityPrefix(event.kind)}\n${delta}\n\n`);
+      continue;
+    }
     const key = eventIdentity(threadId, event);
     if (state.seen.has(key)) continue;
     state.seen.add(key);
@@ -310,7 +320,7 @@ async function main() {
   }
 
   const interactiveDashboard = process.stdout.isTTY && !options.stream && !options.once;
-  const streamState = { threadId: null, seen: new Set(), waitingPrinted: false };
+  const streamState = { threadId: null, seen: new Set(), streamText: new Map(), waitingPrinted: false };
 
   if (interactiveDashboard) process.stdout.write(ANSI.hideCursor);
 

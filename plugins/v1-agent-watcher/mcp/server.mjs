@@ -2,16 +2,18 @@
 import readline from 'node:readline';
 import {
   formatAgentList,
+  formatHealthInspection,
   formatInspection,
+  inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
 } from './watcher.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.1.0' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.3.0' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
-    description: 'List recent Codex child-agent rollout sessions. Use this to find a running V1 subagent before inspecting it.',
+    description: 'List recent Codex V1 thread-spawn child rollout sessions. Internal review/compaction sessions and V2 children are excluded.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -24,8 +26,23 @@ const TOOLS = [
     },
   },
   {
+    name: 'inspect_v1_agent_health',
+    description: 'Run a small deterministic behavioral health screen for one V1 collaboration child. Detects observable looping, repeated failures/backtracking, repeated compaction, and conservative inactivity; it does not judge engineering correctness or return the detailed trace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: { type: 'string', description: 'Exact worker thread id. Strongly preferred for watchdog supervision.' },
+        nickname: { type: 'string', description: 'Exact agent nickname, role, or agent path. Used only when thread_id is omitted.' },
+        cwd: { type: 'string', description: 'Optional exact project cwd filter.' },
+        provider: { type: 'string', description: 'Optional provider filter, for example lmstudio.' },
+        parent_thread_id: { type: 'string', description: 'Optional parent thread filter.' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'inspect_v1_agent',
-    description: 'Inspect recent persisted reasoning, assistant output, and tool activity for a Codex child agent. Use during waits to detect loops or bad approaches before sending corrective input.',
+    description: 'Inspect a small recent window of persisted reasoning, assistant output, and tool activity for one V1 child. Use after deterministic health escalation or when detailed trace inspection is explicitly requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -42,7 +59,7 @@ const TOOLS = [
   },
   {
     name: 'inspect_latest_v1_agent',
-    description: 'Inspect the most recently active Codex child agent, optionally filtered by project cwd or provider. Convenience tool for supervising a single delegated worker.',
+    description: 'Inspect the most recently active V1 child, optionally filtered by project cwd or provider. Do not use after spawning a watchdog; target the worker by exact thread id instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -94,6 +111,19 @@ async function callTool(name, args = {}) {
         textLimit: args.text_limit,
       });
       return resultText(formatInspection(result));
+    }
+    case 'inspect_v1_agent_health': {
+      if (!args.thread_id && !args.nickname) {
+        return { ...resultText('Provide thread_id or nickname.'), isError: true };
+      }
+      const result = await inspectAgentHealth({
+        threadId: args.thread_id,
+        nickname: args.nickname,
+        cwd: args.cwd,
+        provider: args.provider,
+        parentThreadId: args.parent_thread_id,
+      });
+      return resultText(formatHealthInspection(result));
     }
     case 'inspect_latest_v1_agent': {
       const result = await inspectAgentSession({
