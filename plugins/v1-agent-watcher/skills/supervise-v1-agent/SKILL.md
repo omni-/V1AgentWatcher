@@ -41,7 +41,7 @@ Always address the worker by exact `thread_id`. A watchdog is itself a child rol
 
 For Qwen delegation, spawn the registered `qwen` agent type/role.
 
-Never emulate the Qwen role by spawning `agent_type="worker"` with `model="qwen3.8-27b-uncensored-sharp"`. A model override does not carry the role's `model_provider="lmstudio"` configuration, so the local model name is routed through the parent's provider instead of LM Studio. The result is not the configured local Qwen worker, and the persisted `session_meta.model_provider` records the parent's provider rather than `lmstudio`, so provider-filtered watching and post-hoc accounting misattribute the run as well.
+Never emulate the Qwen role by spawning `agent_type="worker"` with `model="qwen3.8-27b-uncensored-sharp"`. A model override does not carry the role's `model_provider="lmstudio"` configuration, so the local model name is routed through the parent's provider instead of LM Studio. The spawn is then not the configured local Qwen worker, whatever it appears to be named.
 
 If the V1 spawn runtime does not expose `qwen` as an agent type, fail immediately and report that the configured Qwen role is unavailable. Do not substitute `worker` plus a Qwen model override, and do not silently delegate to a hosted worker instead. A missing role is a configuration problem for the human to fix, not a supervision decision.
 

@@ -84,7 +84,7 @@ A `progress_stall` escalation follows the same principle. On the first stall Sol
 
 ### Worker role selection
 
-Qwen delegation spawns the registered `qwen` agent type/role. The skill forbids emulating that role with a generic `worker` spawn plus a `qwen3.8-27b-uncensored-sharp` model override: a model override does not carry the role's `model_provider="lmstudio"` configuration, so the local model name is routed through the parent's provider, the run is not the configured local Qwen worker, and its persisted `session_meta.model_provider` records the parent's provider — which also misattributes `v1watch -Provider lmstudio` and the post-hoc accounting. If the spawn runtime does not expose `qwen` as an agent type, the parent fails immediately and reports the configured role as unavailable rather than substituting one.
+Qwen delegation spawns the registered `qwen` agent type/role. The skill forbids emulating that role with a generic `worker` spawn plus a `qwen3.8-27b-uncensored-sharp` model override: a model override does not carry the role's `model_provider="lmstudio"` configuration, so the local model name is routed through the parent's provider, and the spawn is not the configured local Qwen worker. If the spawn runtime does not expose `qwen` as an agent type, the parent fails immediately and reports the configured role as unavailable rather than substituting one.
 
 Luna is different only because the watchdog's whole contract is the prompt in the skill, so it is requested directly by model. That shortcut does not generalize to the worker.
 
