@@ -9,7 +9,7 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
 
 ## Required architecture
 
-1. Spawn the real V1 worker and retain its exact thread ID. Do not pass an explicit granular `reasoning_effort` when the worker runs on a local OpenAI-compatible provider such as `lmstudio`. Note that omitting it inherits the parent effort rather than suppressing the provider's unsupported-setting fallback. See "Local-worker reasoning configuration" below.
+1. Spawn the real V1 worker as its registered agent type and retain its exact thread ID. For Qwen delegation that is the registered `qwen` agent type/role; never emulate it with a generic `worker` spawn plus a Qwen model override. See "Worker role selection" below. Do not pass an explicit granular `reasoning_effort` when the worker runs on a local OpenAI-compatible provider such as `lmstudio`. Note that omitting it inherits the parent effort rather than suppressing the provider's unsupported-setting fallback. See "Local-worker reasoning configuration" below.
 2. Spawn one watchdog with:
    - model `gpt-5.6-luna`
    - low reasoning effort
@@ -36,6 +36,14 @@ After the watchdog is spawned, the parent must remain silent until the watchdog 
 A healthy long wait must never degrade into model-authored background-cell polling. Repeated `wait(cell_id)` calls are not a normal or acceptable supervision path. If Code Mode rejects the explicit 3600000 ms outer yield because the active runtime advertises a lower maximum, or unexpectedly returns `Script running with cell ID ...` before the native wait has completed, treat that as a Code Mode runtime failure: report it clearly and stop the supervision attempt instead of polling the cell. The active runtime must support and accept the one-hour outer yield for this workflow.
 
 Always address the worker by exact `thread_id`. A watchdog is itself a child rollout and may be newer than the worker, so latest-session selection is unsafe after the watchdog has been spawned.
+
+## Worker role selection
+
+For Qwen delegation, spawn the registered `qwen` agent type/role.
+
+Never emulate the Qwen role by spawning `agent_type="worker"` with `model="qwen3.8-27b-uncensored-sharp"`. A model override does not carry the role's `model_provider="lmstudio"` configuration, so the local model name is routed through the parent's provider instead of LM Studio. The spawn is then not the configured local Qwen worker, whatever it appears to be named.
+
+If the V1 spawn runtime does not expose `qwen` as an agent type, fail immediately and report that the configured Qwen role is unavailable. Do not substitute `worker` plus a Qwen model override, and do not silently delegate to a hosted worker instead. A missing role is a configuration problem for the human to fix, not a supervision decision.
 
 ## Local-worker reasoning configuration
 
@@ -304,5 +312,7 @@ Do not use `interrupt=true` for normal supervision. In V1 it aborts the active c
 ## Graceful fallback
 
 Plugins currently distribute this workflow as a skill plus MCP server; they do not need to install user-specific `.codex/agents` configuration. Request Luna directly in the spawn call.
+
+That model-only spawn is specific to the watchdog, whose whole contract is the prompt in this skill. Do not generalize it to the worker: role configuration such as `model_provider` lives in the registered agent definition and not in the model name, so a Qwen worker must be spawned as the `qwen` agent type. See "Worker role selection".
 
 The sibling-safe `wait_v1_agent` MCP operation is part of this plugin and is required for the Luna architecture. If it is unavailable, report the missing plugin capability rather than substituting native sibling `wait_agent`, which is ownership-scoped and may be unavailable to Luna. If `gpt-5.6-luna` itself is unavailable, the parent may perform the same persisted-rollout wait/compact-health loop while preserving the model-specific cadence and three-attempt startup grace.

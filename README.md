@@ -82,6 +82,12 @@ After escalation, inactivity alone is not grounds to abandon a worker. If detail
 
 A `progress_stall` escalation follows the same principle. On the first stall Sol inspects the detailed trace and, if it confirms an established diagnosis and concrete plan, sends one focused continuation to the same worker telling it to implement the smallest supported fix now rather than investigating further; the worker is not replaced. Sol also checks there whether the worker broadened past the original task after already finding a sufficient fix, and may tell it to defer adjacent architectural concerns. If the same worker stalls again after that explicit guidance — reported as `progress_stall_after_guidance`, or as `post_guidance_stall` when it simply resumed investigating without mutating anything — replacement becomes justified. None of this adds polling: progress analysis happens only at the existing health-window boundaries.
 
+### Worker role selection
+
+Qwen delegation spawns the registered `qwen` agent type/role. The skill forbids emulating that role with a generic `worker` spawn plus a `qwen3.8-27b-uncensored-sharp` model override: a model override does not carry the role's `model_provider="lmstudio"` configuration, so the local model name is routed through the parent's provider, and the spawn is not the configured local Qwen worker. If the spawn runtime does not expose `qwen` as an agent type, the parent fails immediately and reports the configured role as unavailable rather than substituting one.
+
+Luna is different only because the watchdog's whole contract is the prompt in the skill, so it is requested directly by model. That shortcut does not generalize to the worker.
+
 ### Local-worker reasoning levels
 
 The model catalog advertises `low`/`medium`/`high`/`xhigh` for local LM Studio workers, but a served model may support only `on` and `off` and will report the requested level as unsupported before falling back to `on`.
