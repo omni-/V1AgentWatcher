@@ -29,7 +29,9 @@ Sol
  └─ Luna: wait on Qwen, run compact health checks, stay silent while healthy
 ```
 
-Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Each MCP wait call is capped at a transport-safe four minutes; Luna quietly composes those chunks into the longer health window. Tool or transport failures do not count as missing-worker windows. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`. Sol waits on Luna and does not inspect Qwen's trace during healthy intervals.
+Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith and ten minutes for an unknown local worker), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Each MCP wait call is capped at a transport-safe 225 seconds and runs inside a 240-second foreground Code Mode execution, leaving 15 seconds for MCP and wrapper completion. Luna quietly composes those chunks into the longer logical health window. Tool or transport failures do not count as missing-worker windows. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`.
+
+Sol waits on Luna through the native one-hour `wait_agent`, with the enclosing Code Mode execution explicitly given the same one-hour yield. This keeps Sol dormant until Luna returns or the native wait genuinely expires. Healthy supervision never uses repeated background-cell `wait(cell_id)` calls; an unexpected background-cell yield is reported as a Code Mode runtime failure.
 
 After escalation, inactivity alone is not grounds to abandon a worker. If detailed inspection still shows `running` with recent persisted activity, Sol keeps that worker unless there is an independent terminal, unreadable, error, or clear loop signal.
 
@@ -171,3 +173,5 @@ npm test
 ```
 
 The MCP server is dependency-free and speaks newline-delimited JSON-RPC over stdio.
+
+The Code Mode execution wrapper is implemented upstream in Codex rather than in this repository. Focused skill tests therefore lock the required generated invocation contract (one-hour parent yield, 240-second Luna outer yield, 225-second MCP chunks, and no healthy background-cell polling), while the server tests lock the MCP timeout schema.

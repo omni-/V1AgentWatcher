@@ -228,7 +228,7 @@ test('persisted-rollout wait times out without treating a missing session as ter
 });
 
 test('persisted-rollout waits clamp oversized requests to a transport-safe chunk', () => {
-  assert.equal(TRANSPORT_SAFE_WAIT_TIMEOUT_MS, 240000);
+  assert.equal(TRANSPORT_SAFE_WAIT_TIMEOUT_MS, 225000);
   assert.equal(normalizeWaitTimeoutMs(900000), TRANSPORT_SAFE_WAIT_TIMEOUT_MS);
   assert.equal(normalizeWaitTimeoutMs(60000), 60000);
 });

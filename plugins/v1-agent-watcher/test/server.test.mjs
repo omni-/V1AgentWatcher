@@ -74,15 +74,15 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   });
 
   const initialized = await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
-  assert.equal(initialized.result.serverInfo.version, '0.6.1');
+  assert.equal(initialized.result.serverInfo.version, '0.6.2');
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'wait_v1_agent'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_usage'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_supervision_usage'));
   const waitTool = listed.result.tools.find((tool) => tool.name === 'wait_v1_agent');
-  assert.equal(waitTool.inputSchema.properties.timeout_ms.maximum, 240000);
-  assert.equal(waitTool.inputSchema.properties.timeout_ms.default, 240000);
+  assert.equal(waitTool.inputSchema.properties.timeout_ms.maximum, 225000);
+  assert.equal(waitTool.inputSchema.properties.timeout_ms.default, 225000);
 
   const inspected = await rpc(3, 'tools/call', {
     name: 'inspect_v1_agent_health',

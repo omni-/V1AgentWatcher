@@ -15,12 +15,25 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
    - low reasoning effort
    - no forked parent context when the spawn API exposes that choice
    - the exact worker thread ID and worker kind (`qwen`, `ornith`, or unknown) in its initial message
-3. Wait on the watchdog, not the worker. Call the native V1 `wait_agent` on the watchdog thread and explicitly set `timeout_ms=3600000`; do not rely on the tool's default timeout. The wait returns early when the watchdog finishes. If that outer wait times out without a terminal watchdog result, immediately call `wait_agent` again on the same watchdog with `timeout_ms=3600000`. Between healthy outer waits, do not inspect the worker or watchdog, emit progress commentary, summarize status, or perform any other parent work.
+3. Wait on the watchdog, not the worker. Call the native V1 `wait_agent` on the watchdog thread with `timeout_ms=3600000` inside one Code Mode execution whose first line explicitly sets `yield_time_ms` to the same 3600000 ms. Do not rely on either timeout's default. Use this invocation shape (substitute the retained watchdog ID):
+
+   ```javascript
+   // @exec: {"yield_time_ms": 3600000}
+   const result = await tools.multi_agent_v1__wait_agent({
+     targets: [watchdogThreadId],
+     timeout_ms: 3600000
+   });
+   text(result);
+   ```
+
+   The native wait returns early when the watchdog finishes, while the matching outer yield keeps Code Mode attached instead of creating a background cell after its short default. If that native one-hour wait genuinely times out without a terminal watchdog result, immediately repeat the same complete Code Mode invocation, including the first-line yield pragma. Between healthy outer waits, do not inspect the worker or watchdog, emit progress commentary, summarize status, or perform any other parent work.
 4. The watchdog stays silent while the worker is healthy. It returns only when the worker completes or observable behavior warrants parent attention.
 5. After `DONE`, the parent reviews the worker's final changes normally. After `NEEDS_SOL_REVIEW`, the parent may call `inspect_v1_agent` for a small detailed window and decide whether queued guidance is needed. A worker that is still `running` with recent persisted activity must be preserved unless inspection also shows an independent concrete terminal, error, unreadable, or repeated-loop signal.
 6. Retain the exact worker and watchdog thread IDs in the final report so the human can measure the completed run afterward with `v1usage -Worker <worker-id> -Watchdog <watchdog-id>`.
 
-After the watchdog is spawned, the parent must remain silent until the watchdog returns `DONE` or `NEEDS_SOL_REVIEW`, the user provides new input, or an actual tool/runtime error requires parent action. A healthy `wait_agent` timeout is not a progress event and must not produce a parent update; re-enter the same explicit one-hour wait immediately.
+After the watchdog is spawned, the parent must remain silent until the watchdog returns `DONE` or `NEEDS_SOL_REVIEW`, the user provides new input, the native one-hour wait genuinely expires, or an actual tool/runtime error requires parent action. A healthy `wait_agent` timeout is not a progress update; re-enter the same explicit one-hour wait immediately.
+
+A healthy long wait must never degrade into model-authored background-cell polling. Repeated `wait(cell_id)` calls are not a normal or acceptable supervision path. If Code Mode rejects the explicit 3600000 ms outer yield because the active runtime advertises a lower maximum, or unexpectedly returns `Script running with cell ID ...` before the native wait has completed, treat that as a Code Mode runtime failure: report it clearly and stop the supervision attempt instead of polling the cell. The active runtime must support and accept the one-hour outer yield for this workflow.
 
 Always address the worker by exact `thread_id`. A watchdog is itself a child rollout and may be newer than the worker, so latest-session selection is unsafe after the watchdog has been spawned.
 
@@ -57,7 +70,18 @@ Do not call inspect_v1_agent unless the parent later asks you to do so.
 
 Loop internally:
 - Use a health window of 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker.
-- Build that health window from transport-safe `wait_v1_agent` calls of at most 240000 ms. Use the smaller of 240000 ms and the remaining health-window duration. These are quiet wait chunks, not health-poll boundaries.
+- Build that health window from transport-safe `wait_v1_agent` calls of at most 225000 ms. Use the smaller of 225000 ms and the remaining health-window duration. These are quiet wait chunks, not health-poll boundaries. Invoke each chunk in one foreground Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin:
+
+  ```javascript
+  // @exec: {"yield_time_ms": 240000}
+  const result = await tools.mcp__v1_agent_watcher__wait_v1_agent({
+    thread_id: workerThreadId,
+    timeout_ms: Math.min(225000, remainingHealthWindowMs)
+  });
+  text(result);
+  ```
+
+  Do not call `wait(cell_id)` to finish an otherwise healthy MCP chunk. An unexpected Code Mode background-cell yield is an enclosing runtime failure, not a completed MCP timeout and not evidence about worker health; return `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` instead of polling that cell.
 - If `wait_v1_agent` reports `completed`, return exactly:
   DONE: worker completed
 - If `wait_v1_agent` reports `terminal_error`, return exactly:
