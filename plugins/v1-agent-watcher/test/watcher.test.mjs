@@ -1301,6 +1301,176 @@ test('compaction bridge handling survives the environment_context filter', () =>
   assert.equal(facts.postGuidanceStall, false);
 });
 
+// The B2 benchmark shape: guidance, a real mutation, then prolonged
+// validation-design investigation with no further edit.
+function postMutationRolloutLines(investigations = 12, mutationIso = '2026-08-20T09:05:00Z') {
+  return [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:02:00Z'),
+    patchLine('m1', mutationIso),
+    ...investigationBurst(investigations, 'v', new Date(Date.parse(mutationIso) + 60_000).toISOString()),
+  ];
+}
+
+test('prolonged investigation after the latest mutation is a post-mutation stall', () => {
+  const lines = postMutationRolloutLines(12);
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:40:00Z'),
+  });
+
+  assert.equal(health.state, 'running');
+  assert.equal(health.health, 'suspicious');
+  assert.ok(health.signals.some((signal) => signal.startsWith('post_mutation_stall:')));
+  assert.equal(health.progress.postMutationStall, true);
+  assert.equal(health.progress.investigationsSinceLatestMutation, 12);
+  assert.equal(health.progress.secondsSinceMutation, 2100);
+  assert.equal(health.progress.currentTurnMutations, 1);
+  // The worker did mutate after guidance, so this is not a post-guidance stall,
+  // and the path is deliberately independent of compaction.
+  assert.equal(health.progress.postGuidanceStall, false);
+  assert.equal(health.progress.mutationsSinceGuidance, 1);
+  assert.equal(health.progress.preMutationStall, false);
+  assert.equal(health.progress.compactions, 0);
+  assert.equal(health.progress.stalled, false);
+});
+
+test('the post-mutation signal reports the elapsed minutes and the read/search count', () => {
+  const health = analyzeAgentHealth(postMutationRolloutLines(12), {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:40:00Z'),
+  });
+
+  const signal = health.signals.find((entry) => entry.startsWith('post_mutation_stall:'));
+  assert.equal(signal, 'post_mutation_stall: 12 read/search calls over 35m since the latest repository mutation');
+});
+
+test('a mutation newer than the post-mutation time threshold stays healthy', () => {
+  const health = analyzeAgentHealth(postMutationRolloutLines(12), {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    // 29 minutes after the mutation.
+    nowMs: Date.parse('2026-08-20T09:34:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.postMutationStall, false);
+  assert.equal(health.progress.secondsSinceMutation, 1740);
+  assert.equal(health.progress.investigationsSinceLatestMutation, 12);
+});
+
+test('a long post-mutation gap below the investigation threshold stays healthy', () => {
+  const health = analyzeAgentHealth(postMutationRolloutLines(9), {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T10:30:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.postMutationStall, false);
+  assert.equal(health.progress.investigationsSinceLatestMutation, 9);
+  assert.equal(health.progress.secondsSinceMutation, 5100);
+});
+
+test('a newer mutation resets both the post-mutation window and the investigation count', () => {
+  const lines = [
+    ...postMutationRolloutLines(12),
+    patchLine('m2', '2026-08-20T09:30:00Z'),
+    ...investigationBurst(2, 'w', '2026-08-20T09:31:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T10:20:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.postMutationStall, false);
+  // Both facts are measured from the newer mutation, not the older one.
+  assert.equal(health.progress.investigationsSinceLatestMutation, 2);
+  assert.equal(health.progress.secondsSinceMutation, 3000);
+  assert.equal(health.progress.currentTurnMutations, 2);
+});
+
+test('build and test commands after a mutation are not investigation calls', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    patchLine('m1', '2026-08-20T09:05:00Z'),
+    shellLine('b1', ['dotnet', 'build'], '2026-08-20T09:06:00Z'),
+    shellLine('b2', ['dotnet', 'test'], '2026-08-20T09:12:00Z'),
+    shellLine('b3', ['dotnet', 'test', '--filter', 'Leaderboard'], '2026-08-20T09:18:00Z'),
+    shellLine('b4', ['npm', 'test'], '2026-08-20T09:24:00Z'),
+    ...investigationBurst(4, 'v', '2026-08-20T09:30:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:50:00Z'),
+  });
+
+  assert.equal(health.progress.investigationsSinceLatestMutation, 4);
+  assert.equal(health.progress.postMutationStall, false);
+  assert.equal(health.signals.some((signal) => signal.startsWith('post_mutation_stall:')), false);
+});
+
+test('post-mutation accounting is scoped to the current turn', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T08:00:00Z'),
+    patchLine('old', '2026-08-20T08:05:00Z'),
+    ...investigationBurst(12, 'old', '2026-08-20T08:06:00Z'),
+    event('event_msg', { type: 'task_complete' }, '2026-08-20T08:30:00Z'),
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(2, 'new', '2026-08-20T09:01:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:40:00Z') });
+
+  // The earlier turn's mutation and investigation burst must not poison this turn.
+  assert.equal(facts.postMutationStall, false);
+  assert.equal(facts.currentTurnMutations, 0);
+});
+
+test('a completed turn is not reported as a post-mutation stall', () => {
+  const facts = collectProgressFacts([
+    ...postMutationRolloutLines(12),
+    event('event_msg', { type: 'task_complete' }, '2026-08-20T09:40:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T10:00:00Z') });
+
+  assert.equal(facts.postMutationStall, false);
+  assert.equal(facts.investigationsSinceLatestMutation, 12);
+});
+
+test('the post-mutation stall escalates for Qwen but not for other worker kinds', () => {
+  const lines = postMutationRolloutLines(12);
+  const options = { secondsSinceActivity: 30, nowMs: Date.parse('2026-08-20T09:40:00Z') };
+
+  const qwen = analyzeAgentHealth(lines, { ...options, agent: { agentNickname: 'qwen' } });
+  assert.equal(qwen.health, 'suspicious');
+  assert.ok(qwen.signals.some((signal) => signal.startsWith('post_mutation_stall:')));
+
+  for (const agent of [{ agentNickname: 'ornith' }, { agentRole: 'reviewer' }, undefined]) {
+    const other = analyzeAgentHealth(lines, { ...options, agent });
+    assert.equal(other.health, 'healthy');
+    assert.equal(other.signals.some((signal) => signal.startsWith('post_mutation_stall:')), false);
+    // The deterministic fact is still reported; only the escalation is gated.
+    assert.equal(other.progress.postMutationStall, true);
+  }
+});
+
+test('a Qwen worker identified by role or agent path still escalates the post-mutation stall', () => {
+  const lines = postMutationRolloutLines(12);
+  const options = { secondsSinceActivity: 30, nowMs: Date.parse('2026-08-20T09:40:00Z') };
+
+  for (const agent of [{ agentRole: 'Qwen' }, { agentPath: 'C:\\agents\\qwen3-coder.toml' }]) {
+    const health = analyzeAgentHealth(lines, { ...options, agent });
+    assert.ok(health.signals.some((signal) => signal.startsWith('post_mutation_stall:')));
+  }
+});
+
 test('the pre-mutation stall escalates for Qwen but not for other worker kinds', () => {
   const lines = [
     event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),

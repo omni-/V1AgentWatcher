@@ -48,6 +48,16 @@ Its thresholds come from Qwen benchmark traces, so only a Qwen worker escalates 
 
 Any repository mutation clears the corresponding stall, and only the newest guidance is in scope so earlier guidance cannot poison later work. Codex persists a framework `<environment_context>` user message before the delegated task and on every continuation turn; those are filtered out first, so the delegated task itself is never mistaken for parent guidance. Persisted commands are normalized before classification — the tool prefix, an explicit shell wrapper (`pwsh -Command ...`), and the PowerShell call operator (`& rg ...`) are all stripped — so none of those wrappers hides a read/search call. Both signals report their supporting facts (`current_turn_seconds`, `current_turn_mutations`, `current_turn_investigations`, `mutations_since_guidance`, `investigations_since_guidance`). Neither shortens the supervision cadence: they are deterministic enough for the first scheduled health-window inspection to catch them.
 
+`post_mutation_stall` covers what comes after a successful edit: the worker changed the repository and then kept investigating instead of finishing. It requires no compaction, implementation-phase phrase, parent guidance, failed command, or repeated command, and requires all of:
+
+1. the current turn is still active;
+2. at least one repository mutation in that turn;
+3. at least 30 minutes since the newest mutation;
+4. at least 10 investigation/read/search calls after that newest mutation;
+5. no later repository mutation.
+
+The newest mutation is the reset point, so a later edit restarts both the elapsed window and the count, and build/test commands are not investigation calls. Its thresholds are Qwen-calibrated too, so only a Qwen worker escalates on it. It reports `post_mutation_stall` and `investigations_since_latest_mutation` alongside the existing `seconds_since_mutation`, which already measures elapsed time from the newest mutation. Because earlier parent guidance may be why the mutation exists, a first `post_mutation_stall` is never treated as the worker ignoring guidance: Sol inspects once, sends one focused continuation telling the worker to preserve the implementation and stop expanding into validation infrastructure, and keeps the same worker. Only a `post_guidance_stall` against that newest continuation re-enters the existing replacement path.
+
 Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. Repeated compaction on its own no longer escalates either — a worker that edits between compactions is productive — so it is reported as a fact and escalates only alongside an independent signal.
 
 `large_tool_output` is reported separately as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate. Reading that header matters because the persisted body is truncated: estimating its stored length would put a 80k-token result well under the threshold.
