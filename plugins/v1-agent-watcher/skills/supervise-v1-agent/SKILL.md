@@ -9,7 +9,7 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
 
 ## Required architecture
 
-1. Spawn the real V1 worker and retain its exact thread ID.
+1. Spawn the real V1 worker and retain its exact thread ID. Do not pass an explicit granular `reasoning_effort` when the worker runs on a local OpenAI-compatible provider such as `lmstudio`. Note that omitting it inherits the parent effort rather than suppressing the provider's unsupported-setting fallback. See "Local-worker reasoning configuration" below.
 2. Spawn one watchdog with:
    - model `gpt-5.6-luna`
    - low reasoning effort
@@ -36,6 +36,31 @@ After the watchdog is spawned, the parent must remain silent until the watchdog 
 A healthy long wait must never degrade into model-authored background-cell polling. Repeated `wait(cell_id)` calls are not a normal or acceptable supervision path. If Code Mode rejects the explicit 3600000 ms outer yield because the active runtime advertises a lower maximum, or unexpectedly returns `Script running with cell ID ...` before the native wait has completed, treat that as a Code Mode runtime failure: report it clearly and stop the supervision attempt instead of polling the cell. The active runtime must support and accept the one-hour outer yield for this workflow.
 
 Always address the worker by exact `thread_id`. A watchdog is itself a child rollout and may be newer than the worker, so latest-session selection is unsafe after the watchdog has been spawned.
+
+## Local-worker reasoning configuration
+
+The Codex model catalog advertises `low`/`medium`/`high`/`xhigh` for local LM Studio models, but the served model may support only `on` and `off`. LM Studio then reports, for example:
+
+```text
+Reasoning setting 'medium' is not supported by model '...'. Supported settings: 'on', 'off'. Falling back to reasoning setting 'on'.
+```
+
+**Omitting `reasoning_effort` does not avoid this.** The V1 spawn interface declares:
+
+```ts
+// Reasoning effort override for the new agent. Omit to inherit the parent effort.
+reasoning_effort?: string;
+```
+
+Omission inherits the parent's current effort, and the inherited granular value is forwarded to the provider like any explicit one. Persisted rollouts confirm it: a spawn that passed no `reasoning_effort` produced a worker whose `turn_context` recorded the parent's own `"effort":"medium"`.
+
+The accurate statement of the limitation:
+
+- The V1 effort enum has no provider-native `on` value, so no spawn setting can request what this model actually supports.
+- Whatever granular level arrives — explicit or inherited — the provider reports it as unsupported and falls back to `on`. That warning is expected for this worker and is not a supervision fault.
+- Reasoning therefore remains enabled, but the level is not honored and is not a meaningful control for this model.
+- Still omit `reasoning_effort` for a local worker: deliberately naming an unsupported level adds nothing. Omission is the honest default, not a fix for the warning.
+- Never describe such a run as, for example, a "medium-effort" run, and do not tune a local worker by changing this level. Luna's own reasoning configuration is unrelated and stays as it is.
 
 ## Post-run accounting
 
@@ -69,34 +94,62 @@ Use only:
 Do not call inspect_v1_agent unless the parent later asks you to do so.
 
 Loop internally:
-- Use a health window of 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker.
-- Build that health window from transport-safe `wait_v1_agent` calls of at most 225000 ms. Use the smaller of 225000 ms and the remaining health-window duration. These are quiet wait chunks, not health-poll boundaries. Invoke each chunk in one foreground Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin:
+- Use a logical health window of 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker.
+- Build that logical window from transport-safe `wait_v1_agent` chunks of at most 225000 ms each. Chunks are quiet waits, not health-poll boundaries.
+- Compose the whole logical window inside ONE foreground Code Mode execution whose first-line yield covers the full window plus a 60000 ms completion margin. One Luna inference then covers the entire window instead of one inference per chunk. Pass the window accounting fields so the boundary is computed deterministically by the tool rather than by your own arithmetic:
 
   ```javascript
-  // @exec: {"yield_time_ms": 240000}
-  const result = await tools.mcp__v1_agent_watcher__wait_v1_agent({
-    thread_id: workerThreadId,
-    timeout_ms: Math.min(225000, remainingHealthWindowMs)
-  });
-  text(result);
+  // @exec: {"yield_time_ms": 960000}
+  const healthWindowMs = 900000;
+  let elapsedMs = 0;
+  let foundInWindow = false;
+  let failures = 0;
+  let last = null;
+  while (elapsedMs < healthWindowMs) {
+    try {
+      last = await tools.mcp__v1_agent_watcher__wait_v1_agent({
+        thread_id: workerThreadId,
+        timeout_ms: Math.min(225000, healthWindowMs - elapsedMs),
+        health_window_ms: healthWindowMs,
+        elapsed_health_window_ms: elapsedMs,
+        found_in_health_window: foundInWindow
+      });
+    } catch (error) {
+      failures += 1;
+      last = { outcome: 'transport_failure', error: String(error) };
+      if (failures >= 3) break;
+      continue;
+    }
+    if (last.outcome !== 'timeout') break;
+    failures = 0;
+    elapsedMs = last.health_window.elapsed_ms;
+    foundInWindow = last.health_window.found_in_window;
+    if (last.health_window.inspect_now || last.health_window.missing_window) break;
+  }
+  text(JSON.stringify({ last, elapsedMs, foundInWindow, failures }));
   ```
 
-  Do not call `wait(cell_id)` to finish an otherwise healthy MCP chunk. An unexpected Code Mode background-cell yield is an enclosing runtime failure, not a completed MCP timeout and not evidence about worker health; return `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` instead of polling that cell.
+  Every individual MCP wait stays at or below 225000 ms, so no single request exceeds the transport-safe limit. The loop never calls `wait(cell_id)` and never creates a background cell. A `completed` or `terminal_error` chunk breaks out immediately, so worker completion still wakes the watchdog early. If the runtime rejects the full-window outer yield, fall back to exactly one 225000 ms chunk per Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin, and carry `elapsed_health_window_ms` and `found_in_health_window` across your own turns. The inspection cadence below is identical either way.
+- Do not call `wait(cell_id)` to finish an otherwise healthy MCP chunk. An unexpected Code Mode background-cell yield is an enclosing runtime failure, not a completed MCP timeout and not evidence about worker health; return `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` instead of polling that cell.
 - If `wait_v1_agent` reports `completed`, return exactly:
   DONE: worker completed
 - If `wait_v1_agent` reports `terminal_error`, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence describing that observable state>
-- Only a returned `outcome: timeout` is a completed wait chunk. Add its actual `waitedMs` to the current health window. A tool exception, MCP failure, or transport timeout contributes zero elapsed wait evidence, says nothing about worker presence or health, and must never increment the missing-worker count.
+- Only a returned `outcome: timeout` is a completed wait chunk, and only a completed chunk contributes its actual `waitedMs` to the current logical health window. A tool exception, MCP failure, transport timeout, or Code Mode yield failure contributes ZERO elapsed health-window time, says nothing about worker presence or health, and must never increment the missing-worker count.
+- A completed chunk with `found=true` immediately resets the missing-worker window count and contributes its `waitedMs` to the current logical window. It does NOT trigger a health inspection by itself. Never call inspect_v1_agent_health merely because a chunk returned.
+- Call inspect_v1_agent_health exactly once per completed logical health window, only when `health_window.inspect_now` is true — that is, only after completed timeout chunks have accumulated the full window and at least one of them observed the worker. For Qwen this means four completed 225000 ms chunks produce one inspection at 900000 ms, not four inspections.
+- After that inspection, reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false, then begin another complete window.
+- `health_window.missing_window` true means a full window completed with every chunk reporting `found=false`. Count one full missing window, reset the window accumulators, and do not inspect. Escalate only after three consecutive full missing windows.
 - Retry a failed transport chunk. If three consecutive transport/tool failures prevent observation, return `NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts`; do not describe the worker as missing or unhealthy.
-- Do not inspect health until completed timeout chunks accumulate one full health window. If every completed chunk in that full window has `found=false`, count one full missing window. Escalate only after three consecutive full missing windows.
-- If any completed chunk in the full window has `found=true`, reset the missing-window count and call inspect_v1_agent_health for the exact worker thread.
 - If state is idle/completed, return exactly:
   DONE: worker completed
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
-- If health is suspicious, unreadable, aborted, or errored, return exactly:
+- If health is suspicious and its signals include `progress_stall`, return exactly:
+  NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation
+- If health is otherwise suspicious, unreadable, aborted, or errored, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence copied or summarized only from the observable health signal>
 - Provider and cwd values are diagnostic context, not identity constraints. Persisted cwd can reflect the parent launch context even when the worker correctly changed its shell cwd.
-- A single self-correction is normal. Qwen producing no new persisted output for up to one hour can still be normal model inference and is not suspicious by itself.
+- A single self-correction is normal. Qwen producing no new persisted output for up to one hour can still be normal model inference and is not suspicious by itself. A single compaction, a long inference, a clean worktree, and one large tool result are each normal on their own; only the deterministic `progress_stall` signal combines them.
 - If health inspection itself cannot inspect the exact thread, wait another full health window before retrying. Escalate only after three such full-window inspection failures, and describe the inspection failure rather than claiming the worker is unhealthy.
 
 Do not emit periodic progress updates. Continue until one terminal line above can be returned.
@@ -106,13 +159,53 @@ Do not emit periodic progress updates. Continue until one terminal line above ca
 
 `inspect_v1_agent_health` is behavioral screening, not code review. It returns a compact state, `healthy` or `suspicious`, a short signal list, and aggregate recent counts. It intentionally omits the detailed trace.
 
-Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, and terminal error/abort states. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
+Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, terminal error/abort states, and `progress_stall`. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
 
 Activity age comes from the newest parseable persisted `event_msg` or `response_item` timestamp. Rollout file mtime is only a fallback because Windows can leave mtime stale while a process holds and appends the JSONL. Premise-reversal screening requires explicit backtracking language; ordinary discourse markers such as bare “wait” or “actually” are not reversals.
+
+### progress_stall
+
+`progress_stall` recognizes a worker that is technically active but no longer making engineering progress. It is computed only from persisted rollout facts, never from a judgement about the engineering task, and requires all of:
+
+1. the worker committed to an implementation phase (an explicit implementation plan or an explicit statement that it is now applying the change);
+2. at least two context compactions occurred after that commitment;
+3. no persisted repository-mutation call occurred since — mutation evidence is any persisted patch/write/mutating-shell call, and any such call resets all of this evidence;
+4. after the newest compaction the worker returned to repository rediscovery (three or more read/search calls) or reconstructed the implementation plan again instead of implementing.
+
+The health result also reports the supporting facts: `compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, and `progress_stall_after_guidance`.
+
+One compaction, one long inference, a clean worktree before implementation begins, and one huge tool result are each insufficient alone and deliberately do not escalate. Repeated compaction alone is also insufficient now that progress_stall is the discriminating signal: it is reported, and escalates only when an independent signal corroborates it.
+
+`large_tool_output` is reported as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate — the persisted body is truncated, so its stored length understates a pathological result.
 
 ## Steering after escalation
 
 If the parent determines that ordinary technical guidance is needed, send one concise correction through V1 `send_input` with `interrupt=false`, or omit the flag only when omission means queued input. Prefer a factual constraint or concrete next action.
+
+### First progress stall: continue the same worker
+
+A `progress_stall` escalation never justifies killing a live worker by itself. Recent persisted activity still means the worker is alive; suspicion is a reason for parent review, not automatic abandonment.
+
+On the first `progress_stall` escalation:
+
+1. Call `inspect_v1_agent` once for a small detailed window.
+2. If that trace confirms the diagnosis is already established, the implementation plan is concrete, and the worker has repeatedly compacted or replanned without mutating the repository, send ONE focused continuation to the SAME worker through `send_input` with `interrupt=false`:
+
+   ```text
+   Stop investigating. Use the diagnosis and implementation plan you already established.
+   Implement the smallest supported fix now, then run the focused tests.
+   Do not broaden scope unless implementation evidence requires it.
+   ```
+
+3. Resume the same worker and the same Luna supervision loop. Do not replace the worker and do not spawn a second worker.
+
+While reviewing that trace, also check whether the worker expanded past the originally requested task after it had already identified a sufficient fix. If it did, the continuation may add one sentence telling it to implement the smallest fix supported by the original task and to defer adjacent architectural concerns unless correctness requires them. This is a scope instruction from the parent, not a code review by the watchdog; Luna never judges which fix is correct.
+
+### Repeated progress stall after guidance
+
+If the same worker stalls again after that explicit implementation guidance — another compaction/replanning cycle with no mutation, reported as `progress_stall_after_guidance: true` — replacement becomes justified. Close that worker and spawn a replacement whose initial task carries the established diagnosis, the implementation plan, and an explicit instruction to implement before investigating further.
+
+Do not add progress polling to detect any of this. Progress analysis happens only at the existing logical health-window boundaries or when the worker emits a terminal or suspicious state.
 
 An inactivity-only or watchdog-transport escalation is a request to inspect, not permission to abandon the worker. If detailed inspection shows `state: running` and recent persisted activity below the applicable inactivity threshold, keep the existing worker. Replace or interrupt only when there is separate concrete evidence such as a terminal abort/error, an unreadable rollout that prevents safe supervision, or a clear repeated loop/failure pattern. Do not weaken those terminal and loop cases.
 

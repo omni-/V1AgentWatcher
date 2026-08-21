@@ -7,8 +7,8 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 ## Tools
 
 - `list_v1_agents` — list recent child rollout sessions and their thread/parent/provider metadata.
-- `wait_v1_agent` — wait on one exact persisted rollout until terminal state or timeout, without native parent/child wait ownership.
-- `inspect_v1_agent_health` — run a compact deterministic behavioral screen for one exact V1 worker thread without returning its detailed trace.
+- `wait_v1_agent` — wait on one exact persisted rollout until terminal state or timeout, without native parent/child wait ownership, optionally returning deterministic logical health-window accounting for composed chunks.
+- `inspect_v1_agent_health` — run a compact deterministic behavioral and progress screen for one exact V1 worker thread without returning its detailed trace.
 - `inspect_v1_agent` — inspect recent reasoning, assistant messages, and tool activity for a specific child.
 - `inspect_latest_v1_agent` — convenience tool for supervising the most recently active child, optionally filtered by cwd/provider.
 
@@ -17,7 +17,22 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 
 The watcher intentionally returns only a short recent window and truncates individual events so supervision costs far fewer parent-model tokens than replaying the full rollout.
 
-The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated explicit premise reversals, repeated compaction, terminal errors, and conservative inactivity. Bare discourse markers such as “wait” and “actually” are not reversals. One self-correction and up to an hour without persisted Qwen activity are not suspicious by themselves. Activity age uses the newest persisted rollout event timestamp when available and falls back to file mtime only when necessary.
+The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated explicit premise reversals, repeated compaction, terminal errors, conservative inactivity, and progress stalls. Bare discourse markers such as “wait” and “actually” are not reversals. One self-correction and up to an hour without persisted Qwen activity are not suspicious by themselves. Activity age uses the newest persisted rollout event timestamp when available and falls back to file mtime only when necessary.
+
+### Progress stalls
+
+A worker can stay technically active — still reasoning, still calling tools — while engineering progress has stopped. `progress_stall` recognizes that pattern from persisted rollout facts alone. It requires all of:
+
+1. the worker committed to an implementation phase (an explicit implementation plan, or an explicit statement that it is now applying the change);
+2. at least two context compactions after that commitment;
+3. no persisted repository-mutation call since — any patch/write/mutating-shell call resets the evidence;
+4. renewed rediscovery or replanning after the newest compaction instead of implementation.
+
+The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes.
+
+Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. Repeated compaction on its own no longer escalates either — a worker that edits between compactions is productive — so it is reported as a fact and escalates only alongside an independent signal.
+
+`large_tool_output` is reported separately as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate. Reading that header matters because the persisted body is truncated: estimating its stored length would put a 80k-token result well under the threshold.
 
 ## Cheap watchdog supervision
 
@@ -29,11 +44,21 @@ Sol
  └─ Luna: wait on Qwen, run compact health checks, stay silent while healthy
 ```
 
-Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith and ten minutes for an unknown local worker), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Each MCP wait call is capped at a transport-safe 225 seconds and runs inside a 240-second foreground Code Mode execution, leaving 15 seconds for MCP and wrapper completion. Luna quietly composes those chunks into the longer logical health window. Tool or transport failures do not count as missing-worker windows. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`.
+Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith and ten minutes for an unknown local worker), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Each MCP wait call is capped at a transport-safe 225 seconds, and Luna composes a whole logical health window from those chunks inside ONE foreground Code Mode execution — a deterministic loop, not a background cell — so a fifteen-minute Qwen window costs one Luna inference rather than one per chunk. If the runtime rejects the full-window outer yield, the fallback is one 225-second chunk per execution inside a 240-second yield, leaving 15 seconds for MCP and wrapper completion.
+
+`wait_v1_agent` accepts optional `health_window_ms` / `elapsed_health_window_ms` / `found_in_health_window` arguments and returns the accumulated window state, so the inspection boundary is computed deterministically instead of being re-derived by the watchdog each turn. A completed chunk that observed the worker resets missing-worker state and contributes its elapsed time, but never triggers an inspection by itself; health is inspected exactly once per completed logical window. Tool, transport, and Code Mode yield failures contribute zero elapsed time and do not count as missing-worker windows. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`.
 
 Sol waits on Luna through the native one-hour `wait_agent`, with the enclosing Code Mode execution explicitly given the same one-hour yield. This keeps Sol dormant until Luna returns or the native wait genuinely expires. Healthy supervision never uses repeated background-cell `wait(cell_id)` calls; an unexpected background-cell yield is reported as a Code Mode runtime failure.
 
 After escalation, inactivity alone is not grounds to abandon a worker. If detailed inspection still shows `running` with recent persisted activity, Sol keeps that worker unless there is an independent terminal, unreadable, error, or clear loop signal.
+
+A `progress_stall` escalation follows the same principle. On the first stall Sol inspects the detailed trace and, if it confirms an established diagnosis and concrete plan, sends one focused continuation to the same worker telling it to implement the smallest supported fix now rather than investigating further; the worker is not replaced. Sol also checks there whether the worker broadened past the original task after already finding a sufficient fix, and may tell it to defer adjacent architectural concerns. If the same worker stalls again after that explicit guidance — reported as `progress_stall_after_guidance` — replacement becomes justified. None of this adds polling: progress analysis happens only at the existing health-window boundaries.
+
+### Local-worker reasoning levels
+
+The model catalog advertises `low`/`medium`/`high`/`xhigh` for local LM Studio workers, but a served model may support only `on` and `off` and will report the requested level as unsupported before falling back to `on`.
+
+Omitting `reasoning_effort` does not avoid that. V1 declares the field as “omit to inherit the parent effort”, and persisted rollouts confirm it: a spawn passing no `reasoning_effort` produced a worker whose `turn_context` recorded the parent's own `medium`. The enum has no provider-native `on` value, so no spawn setting can request what the model actually supports. The skill still omits the field — deliberately naming an unsupported level adds nothing — but documents the limitation instead of claiming omission suppresses the warning. Reasoning stays enabled through the provider's fallback; the level is not honored, so a run should never be described as, for example, a “medium-effort” run.
 
 The watchdog always uses the worker's exact thread ID. Provider and persisted cwd are informational and are not used as identity filters because rollout metadata can retain the parent launch cwd. Once Luna is running, it may be the newest child session, so `inspect_latest_v1_agent` is not safe for the worker in this flow.
 
@@ -174,4 +199,4 @@ npm test
 
 The MCP server is dependency-free and speaks newline-delimited JSON-RPC over stdio.
 
-The Code Mode execution wrapper is implemented upstream in Codex rather than in this repository. Focused skill tests therefore lock the required generated invocation contract (one-hour parent yield, 240-second Luna outer yield, 225-second MCP chunks, and no healthy background-cell polling), while the server tests lock the MCP timeout schema.
+The Code Mode execution wrapper is implemented upstream in Codex rather than in this repository. Focused skill tests therefore lock the required generated invocation contract (one-hour parent yield, the composed Luna window loop with 225-second MCP chunks, one health inspection per completed logical window, no healthy background-cell polling, the first-stall/repeated-stall parent policy, and local-worker reasoning omission), while the server tests lock the MCP timeout and health-window schema.

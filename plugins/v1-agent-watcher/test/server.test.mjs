@@ -74,7 +74,7 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   });
 
   const initialized = await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
-  assert.equal(initialized.result.serverInfo.version, '0.6.2');
+  assert.equal(initialized.result.serverInfo.version, '0.6.3');
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'wait_v1_agent'));
@@ -83,6 +83,9 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   const waitTool = listed.result.tools.find((tool) => tool.name === 'wait_v1_agent');
   assert.equal(waitTool.inputSchema.properties.timeout_ms.maximum, 225000);
   assert.equal(waitTool.inputSchema.properties.timeout_ms.default, 225000);
+  assert.ok(waitTool.inputSchema.properties.health_window_ms);
+  assert.equal(waitTool.inputSchema.properties.elapsed_health_window_ms.default, 0);
+  assert.equal(waitTool.inputSchema.properties.found_in_health_window.default, false);
 
   const inspected = await rpc(3, 'tools/call', {
     name: 'inspect_v1_agent_health',
@@ -94,6 +97,9 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(health.state, 'running');
   assert.equal(health.health, 'healthy');
   assert.equal('events' in health, false);
+  assert.equal(health.progress.progress_stall, false);
+  assert.equal(health.progress.compactions_since_mutation, 0);
+  assert.equal(health.progress.seconds_since_mutation, null);
 
   await fs.appendFile(
     path.join(sessions, 'rollout-qwen.jsonl'),
@@ -107,6 +113,26 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(waited.result.isError, undefined);
   assert.equal(waited.result.structuredContent.outcome, 'completed');
   assert.equal(waited.result.structuredContent.threadId, 'qwen-thread');
+  assert.equal('health_window' in waited.result.structuredContent, false);
+
+  const windowed = await rpc(6, 'tools/call', {
+    name: 'wait_v1_agent',
+    arguments: {
+      thread_id: 'qwen-thread',
+      timeout_ms: 1000,
+      health_window_ms: 900000,
+      elapsed_health_window_ms: 675000,
+      found_in_health_window: true,
+    },
+  });
+  // A non-timeout chunk contributes no elapsed health-window time and never
+  // reaches the inspection boundary by itself.
+  const window = windowed.result.structuredContent.health_window;
+  assert.equal(window.elapsed_ms, 675000);
+  assert.equal(window.remaining_ms, 225000);
+  assert.equal(window.next_chunk_ms, 225000);
+  assert.equal(window.inspect_now, false);
+  assert.equal(window.missing_window, false);
 
   const usage = await rpc(4, 'tools/call', {
     name: 'inspect_v1_agent_usage',

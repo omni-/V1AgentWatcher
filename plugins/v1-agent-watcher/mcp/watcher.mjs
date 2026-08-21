@@ -14,6 +14,20 @@ export const TRANSPORT_SAFE_WAIT_TIMEOUT_MS = 225 * 1000;
 const DEFAULT_WAIT_TIMEOUT_MS = TRANSPORT_SAFE_WAIT_TIMEOUT_MS;
 const DEFAULT_WAIT_POLL_INTERVAL_MS = 5000;
 
+// Progress screening. A stall requires several independent persisted facts, so
+// every individual threshold below is deliberately conservative on its own.
+const LARGE_TOOL_OUTPUT_TOKENS = 20000;
+const ESTIMATED_CHARS_PER_TOKEN = 4;
+const PROGRESS_STALL_COMPACTIONS = 2;
+const PROGRESS_STALL_REDISCOVERY_COMMANDS = 3;
+const COMPACTION_BRIDGE_RECORDS = 3;
+const COMPACTION_EVENT_TYPES = new Set([
+  'context_compacted',
+  'conversation_compacted',
+  'compacted',
+  'auto_compact_completed',
+]);
+
 const recentRolloutCache = new Map();
 
 export function getCodexHome(env = process.env) {
@@ -700,6 +714,286 @@ function collectHealthFacts(lines) {
   return { commands: commands.slice(-200), compactions, malformedLines };
 }
 
+// Read-only discovery calls. Used both for the existing investigation-only
+// signal and for post-compaction rediscovery.
+const INVESTIGATION_COMMAND_PATTERN = /^(?:exec_command|shell|local_shell|container\.exec)?\s*(?:rg|grep|egrep|find|fd|ls|dir|tree|gci|get-childitem|get-content|cat|type|head|tail|sed\s+-n|select-string|read_file|list_dir|glob|git\s+(?:diff|status|log|show))\b/i;
+
+// Persisted evidence that the worker actually changed the repository. This is
+// intentionally broad: a false mutation only suppresses a stall signal, while a
+// missed mutation could produce a false stall.
+const MUTATION_COMMAND_PATTERNS = [
+  /\b(?:apply_patch|applypatch|write_file|edit_file|create_file|str_replace|update_file|patch_file|set-content|add-content|out-file|new-item|tee|sed\s+-i|git\s+(?:apply|add|commit|mv|rm|restore|checkout\s+-b))\b/i,
+  /\s1?>>?\s*[a-z0-9_.\\/-]+/i,
+];
+
+// Explicit commitment to an implementation phase. These must stay anchored
+// multi-word phrases; bare words such as "fix" or "plan" are ordinary discourse.
+const IMPLEMENTATION_PHASE_PATTERNS = [
+  /\bimplementation plan\b/i,
+  /\b(?:i|we)(?:'m|'ll| am| will) (?:now )?(?:going to )?(?:apply|implement|make|write) (?:the|these|those|my|our) (?:change|changes|fix|fixes|edit|edits|patch|implementation)\b/i,
+  /\b(?:now|let(?:'s| me)) (?:apply|implement|write) (?:the|these|those) (?:change|changes|fix|fixes|edit|edits|patch)\b/i,
+  /\bready to (?:implement|apply) (?:the|this|these) (?:fix|change|changes|patch|plan)\b/i,
+  /\btime to (?:implement|apply) (?:the|this|these) (?:fix|change|changes|patch)\b/i,
+];
+
+function isInvestigationCommand(display) {
+  return INVESTIGATION_COMMAND_PATTERN.test(String(display ?? ''));
+}
+
+function isMutationCommand(display) {
+  const text = String(display ?? '');
+  return MUTATION_COMMAND_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function isImplementationPhaseText(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return false;
+  return IMPLEMENTATION_PHASE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+// Codex writes the pre-truncation size into the persisted output text, for
+// example "Original token count: 80219" or "truncated output (original token
+// count: 80219)". Both spellings resolve to the same authoritative number.
+const REPORTED_TOKEN_COUNT_PATTERN = /original token count:?\s*([0-9][0-9_,]*)/gi;
+
+function toolOutputText(payload) {
+  const raw = payload.output ?? payload.result ?? payload.aggregated_output ?? payload.formatted_output ?? payload.stdout ?? '';
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object') {
+    const nested = raw.output ?? raw.result ?? raw.stdout ?? null;
+    return typeof nested === 'string' ? nested : JSON.stringify(raw);
+  }
+  return '';
+}
+
+function toolOutputTokens(payload) {
+  const containers = [
+    payload,
+    payload.metadata,
+    typeof payload.output === 'object' ? payload.output : null,
+    typeof payload.output === 'object' ? payload.output?.metadata : null,
+    typeof payload.result === 'object' ? payload.result : null,
+    typeof payload.result === 'object' ? payload.result?.metadata : null,
+  ];
+  for (const container of containers) {
+    if (!container || typeof container !== 'object') continue;
+    for (const key of ['original_token_count', 'originalTokenCount', 'token_count', 'tokenCount', 'output_tokens', 'outputTokens']) {
+      const value = Number(container[key]);
+      if (Number.isFinite(value) && value > 0) return { tokens: Math.round(value), source: 'metadata' };
+    }
+  }
+
+  const text = toolOutputText(payload);
+  if (!text) return null;
+
+  // Codex persists the pre-truncation size in the output body itself. The
+  // stored text is truncated, so estimating its length would badly understate a
+  // pathological result; the reported count is authoritative when present.
+  let reported = 0;
+  for (const match of text.matchAll(REPORTED_TOKEN_COUNT_PATTERN)) {
+    const value = Number(String(match[1]).replace(/[_,]/g, ''));
+    if (Number.isFinite(value) && value > reported) reported = value;
+  }
+  if (reported > 0) return { tokens: Math.round(reported), source: 'reported' };
+
+  return { tokens: Math.ceil(text.length / ESTIMATED_CHARS_PER_TOKEN), source: 'estimated' };
+}
+
+function reasoningText(payload) {
+  const summary = Array.isArray(payload.summary)
+    ? payload.summary.map((part) => part?.text).filter(Boolean)
+    : [];
+  const content = textBlocks(payload.content);
+  return content.length ? content.join(' ') : summary.join(' ');
+}
+
+function lastIndexOfKind(events, kind) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].kind === kind) return index;
+  }
+  return -1;
+}
+
+export function emptyProgressFacts() {
+  return {
+    compactions: 0,
+    mutations: 0,
+    compactionsSinceMutation: 0,
+    secondsSinceMutation: null,
+    implementationPhaseCommitted: false,
+    implementationPhaseReentered: false,
+    postCompactionRediscovery: false,
+    stalled: false,
+    stalledAfterGuidance: false,
+    guidanceMessages: 0,
+    largeToolOutputs: 0,
+    largestToolOutputTokens: 0,
+    largestToolOutputSource: null,
+  };
+}
+
+/**
+ * Evaluate the progress-stall conditions over one ordered slice of progress
+ * events. Every condition must hold: an implementation phase was committed, at
+ * least two compactions followed it, and the newest compaction was followed by
+ * renewed rediscovery or replanning rather than implementation.
+ */
+function evaluateStall(events) {
+  const firstImplementation = events.findIndex((event) => event.kind === 'implementation_phase');
+  const afterImplementation = firstImplementation >= 0 ? events.slice(firstImplementation) : [];
+  const compactionsAfterImplementation = afterImplementation.filter((event) => event.kind === 'compaction').length;
+  const lastCompaction = lastIndexOfKind(events, 'compaction');
+  const afterLastCompaction = lastCompaction >= 0 ? events.slice(lastCompaction + 1) : [];
+  const rediscoveryCommands = afterLastCompaction.filter((event) => event.kind === 'investigation').length;
+  const replanned = afterLastCompaction.some((event) => event.kind === 'implementation_phase');
+  const postCompactionRediscovery = rediscoveryCommands >= PROGRESS_STALL_REDISCOVERY_COMMANDS || replanned;
+
+  return {
+    compactions: events.filter((event) => event.kind === 'compaction').length,
+    implementationPhaseCommitted: firstImplementation >= 0,
+    implementationPhaseReentered: afterImplementation.filter((event) => event.kind === 'implementation_phase').length >= 2,
+    postCompactionRediscovery,
+    stalled: firstImplementation >= 0
+      && compactionsAfterImplementation >= PROGRESS_STALL_COMPACTIONS
+      && postCompactionRediscovery,
+  };
+}
+
+/**
+ * Collect deterministic whole-rollout progress facts. This never interprets the
+ * worker's engineering theory; it only counts persisted mutation, compaction,
+ * rediscovery, and implementation-phase markers.
+ */
+export function collectProgressFacts(lines, options = {}) {
+  const events = [];
+  const seenCallIds = new Set();
+  let recordsSinceCompaction = Number.POSITIVE_INFINITY;
+  let userMessages = 0;
+  let previousUserText = null;
+  let largeToolOutputs = 0;
+  let largestToolOutputTokens = 0;
+  let largestToolOutputSource = null;
+
+  const addCommand = (callId, display, timestampMs) => {
+    if (callId) {
+      if (seenCallIds.has(callId)) return;
+      seenCallIds.add(callId);
+    }
+    if (!display) return;
+    if (isMutationCommand(display)) events.push({ kind: 'mutation', timestampMs });
+    else if (isInvestigationCommand(display)) events.push({ kind: 'investigation', timestampMs });
+  };
+
+  const addText = (text, timestampMs) => {
+    if (isImplementationPhaseText(text)) events.push({ kind: 'implementation_phase', timestampMs });
+  };
+
+  const addUserMessage = (text, timestampMs) => {
+    const normalized = normalizeText(text);
+    if (normalized && normalized === previousUserText) return;
+    previousUserText = normalized;
+    userMessages += 1;
+    // The first user message is the delegated task, and a message persisted
+    // immediately after compaction is the compaction bridge summary. Neither is
+    // parent guidance.
+    if (userMessages === 1) return;
+    if (recordsSinceCompaction <= COMPACTION_BRIDGE_RECORDS) return;
+    events.push({ kind: 'guidance', timestampMs });
+  };
+
+  const addOutput = (payload) => {
+    const size = toolOutputTokens(payload);
+    if (!size) return;
+    if (size.tokens >= LARGE_TOOL_OUTPUT_TOKENS) largeToolOutputs += 1;
+    if (size.tokens > largestToolOutputTokens) {
+      largestToolOutputTokens = size.tokens;
+      largestToolOutputSource = size.source;
+    }
+  };
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const payload = record.payload ?? {};
+    const parsedTimestamp = Date.parse(record.timestamp);
+    const timestampMs = Number.isFinite(parsedTimestamp) ? parsedTimestamp : null;
+    recordsSinceCompaction += 1;
+
+    if (record.type === 'event_msg') {
+      if (COMPACTION_EVENT_TYPES.has(payload.type)) {
+        events.push({ kind: 'compaction', timestampMs });
+        recordsSinceCompaction = 0;
+      } else if (payload.type === 'exec_command_begin') {
+        const command = Array.isArray(payload.command) ? payload.command.join(' ') : payload.command;
+        addCommand(payload.call_id ?? null, normalizeText(`shell ${command ?? ''}`), timestampMs);
+      } else if (payload.type === 'exec_command_end') {
+        addOutput(payload);
+      } else if (payload.type === 'agent_reasoning' || payload.type === 'agent_reasoning_raw_content' || payload.type === 'agent_message') {
+        addText(payload.text ?? payload.message, timestampMs);
+      } else if (payload.type === 'user_message') {
+        addUserMessage(payload.message ?? payload.text, timestampMs);
+      }
+    } else if (record.type === 'response_item') {
+      if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+        const command = commandFromCall(payload);
+        addCommand(command.callId, command.display, timestampMs);
+      } else if (payload.type === 'local_shell_call') {
+        const action = payload.action ?? {};
+        const direct = action.command ?? action.cmd ?? action.script ?? stableStringify(action);
+        addCommand(
+          payload.call_id ?? payload.id ?? null,
+          normalizeText(`shell ${Array.isArray(direct) ? direct.join(' ') : direct}`),
+          timestampMs,
+        );
+      } else if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+        addOutput(payload);
+      } else if (payload.type === 'reasoning') {
+        addText(reasoningText(payload), timestampMs);
+      } else if (payload.type === 'message') {
+        const text = textBlocks(payload.content).join(' ');
+        if (payload.role === 'assistant') addText(text, timestampMs);
+        else if (payload.role === 'user') addUserMessage(text, timestampMs);
+      }
+    }
+  }
+
+  const lastMutationIndex = lastIndexOfKind(events, 'mutation');
+  const lastGuidanceIndex = lastIndexOfKind(events, 'guidance');
+  // Any mutation clears prior stall evidence: only events after the newest
+  // observed repository change can describe a current stall. The same
+  // evaluation restarted after the newest parent guidance message distinguishes
+  // a first stall from one that repeated despite explicit guidance.
+  const stallFrom = (start) => evaluateStall(events.slice(start));
+  const sinceMutation = stallFrom(lastMutationIndex + 1);
+  const sinceGuidance = lastGuidanceIndex >= 0
+    ? stallFrom(Math.max(lastMutationIndex, lastGuidanceIndex) + 1)
+    : null;
+  const lastMutationMs = lastMutationIndex >= 0 ? events[lastMutationIndex].timestampMs : null;
+  const nowMs = options.nowMs ?? Date.now();
+
+  return {
+    compactions: events.filter((event) => event.kind === 'compaction').length,
+    mutations: events.filter((event) => event.kind === 'mutation').length,
+    compactionsSinceMutation: sinceMutation.compactions,
+    secondsSinceMutation: lastMutationMs === null ? null : Math.max(0, Math.round((nowMs - lastMutationMs) / 1000)),
+    implementationPhaseCommitted: sinceMutation.implementationPhaseCommitted,
+    implementationPhaseReentered: sinceMutation.implementationPhaseReentered,
+    postCompactionRediscovery: sinceMutation.postCompactionRediscovery,
+    stalled: sinceMutation.stalled,
+    stalledAfterGuidance: Boolean(sinceGuidance?.stalled),
+    guidanceMessages: events.filter((event) => event.kind === 'guidance').length,
+    largeToolOutputs,
+    largestToolOutputTokens,
+    largestToolOutputSource,
+  };
+}
+
 function latestTurnLines(lines) {
   let latestStart = -1;
   for (let index = 0; index < lines.length; index += 1) {
@@ -760,12 +1054,9 @@ export function analyzeAgentHealth(lines, options = {}) {
   const repeatedCommands = repeatedGroup(facts.commands);
   const failedCommands = facts.commands.filter((command) => command.failed);
   const repeatedFailures = repeatedGroup(failedCommands);
-  const investigationCount = facts.commands.filter((command) =>
-    /^(?:exec_command|shell)?\s*(?:rg|grep|find|fd|ls|dir|get-childitem|get-content|select-string|git\s+(?:diff|status|log|show))\b/i.test(command.display)
-  ).length;
-  const mutationCount = facts.commands.filter((command) =>
-    /\b(?:apply_patch|write_file|edit_file|set-content|add-content|out-file|sed\s+-i|git\s+(?:add|commit|mv|rm))\b/i.test(command.display)
-  ).length;
+  const investigationCount = facts.commands.filter((command) => isInvestigationCommand(command.display)).length;
+  const mutationCount = facts.commands.filter((command) => isMutationCommand(command.display)).length;
+  const progress = collectProgressFacts(lines, { nowMs: options.nowMs });
 
   const signals = [];
   let concernScore = 0;
@@ -785,12 +1076,25 @@ export function analyzeAgentHealth(lines, options = {}) {
     concernScore += 2;
   }
   if (facts.compactions >= 2) {
+    // Repeated compaction is reported but no longer escalates on its own.
+    // Compaction says nothing about progress by itself — a productive worker
+    // that edits between compactions is healthy. The mutation-aware
+    // progress_stall signal below carries the discriminating weight, and this
+    // fact still escalates when combined with any other independent signal.
     signals.push(`context_compaction: ${facts.compactions} recent compactions`);
-    concernScore += 2;
+    concernScore += 1;
   }
   if (investigationCount >= 15 && mutationCount === 0) {
     signals.push(`investigation_only: ${investigationCount} read/search calls without an observed write action`);
     concernScore += 1;
+  }
+  if (progress.stalled) {
+    const guidance = progress.stalledAfterGuidance ? ' after earlier parent guidance' : '';
+    signals.push(`progress_stall: implementation phase established${guidance}, then ${progress.compactionsSinceMutation} context compactions with no repository mutation and renewed investigation/replanning`);
+    concernScore += 2;
+  }
+  if (progress.largeToolOutputs) {
+    signals.push(`large_tool_output: ${progress.largeToolOutputs} tool results above ~${LARGE_TOOL_OUTPUT_TOKENS} tokens (largest ~${progress.largestToolOutputTokens}, ${progress.largestToolOutputSource})`);
   }
 
   const secondsSinceActivity = Number(options.secondsSinceActivity ?? 0);
@@ -805,6 +1109,7 @@ export function analyzeAgentHealth(lines, options = {}) {
     state: summary.status,
     health: !completed && concernScore >= 2 ? 'suspicious' : 'healthy',
     signals,
+    progress,
     recentSummary: {
       reasoningUpdates: reasoningEvents.length,
       commandCalls: facts.commands.length,
@@ -889,6 +1194,7 @@ async function inspectResolvedAgentHealth(agent, options = {}) {
       health: 'suspicious',
       secondsSinceActivity: Math.max(0, Math.round(((options.nowMs ?? Date.now()) - agent.updatedAtMs) / 1000)),
       signals: ['rollout_unreadable: the selected rollout could not be read'],
+      progress: emptyProgressFacts(),
       recentSummary: {
         reasoningUpdates: 0,
         commandCalls: 0,
@@ -911,6 +1217,7 @@ async function inspectResolvedAgentHealth(agent, options = {}) {
     secondsSinceActivity,
     inactivitySeconds: options.inactivitySeconds,
     initialStatus: recent.entry.status,
+    nowMs: options.nowMs,
   });
   recent.entry.status = analysis.state;
 
@@ -934,6 +1241,32 @@ export function normalizeWaitTimeoutMs(value, maximum = TRANSPORT_SAFE_WAIT_TIME
     TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
   );
   return clampInt(value, 1, maximumTimeoutMs, Math.min(DEFAULT_WAIT_TIMEOUT_MS, maximumTimeoutMs));
+}
+
+/**
+ * Deterministic logical health-window accounting for composed transport-safe
+ * wait chunks. Only a completed `timeout` chunk contributes elapsed time, and a
+ * chunk that observed the worker never triggers an inspection by itself: health
+ * inspection happens exactly once per completed logical window.
+ */
+export function accumulateHealthWindow(options = {}) {
+  const windowMs = clampInt(options.windowMs, 1, 24 * 60 * 60 * 1000, TRANSPORT_SAFE_WAIT_TIMEOUT_MS);
+  const previousElapsedMs = clampInt(options.elapsedMs, 0, 24 * 60 * 60 * 1000, 0);
+  const contributedMs = options.outcome === 'timeout'
+    ? clampInt(options.waitedMs, 0, 24 * 60 * 60 * 1000, 0)
+    : 0;
+  const elapsedMs = previousElapsedMs + contributedMs;
+  const foundInWindow = Boolean(options.foundInWindow) || (options.outcome === 'timeout' && Boolean(options.found));
+  const remainingMs = Math.max(0, windowMs - elapsedMs);
+  return {
+    windowMs,
+    elapsedMs,
+    remainingMs,
+    nextChunkMs: Math.min(TRANSPORT_SAFE_WAIT_TIMEOUT_MS, remainingMs > 0 ? remainingMs : windowMs),
+    foundInWindow,
+    inspectNow: elapsedMs >= windowMs && foundInWindow,
+    missingWindow: elapsedMs >= windowMs && !foundInWindow,
+  };
 }
 
 export async function waitForAgent(options = {}) {
@@ -1038,6 +1371,7 @@ export function formatInspection(result) {
 export function formatHealthInspection(result) {
   if (!result) return 'No matching V1 collaboration child-agent rollout session found.';
   const label = result.agent.agentNickname ?? result.agent.agentRole ?? result.agent.agentPath ?? result.agent.threadId ?? '(unknown)';
+  const progress = result.progress ?? emptyProgressFacts();
   return JSON.stringify({
     agent: label,
     thread: result.agent.threadId,
@@ -1046,6 +1380,21 @@ export function formatHealthInspection(result) {
     seconds_since_activity: result.secondsSinceActivity,
     activity_source: result.activitySource,
     signals: result.signals,
+    progress: {
+      progress_stall: progress.stalled,
+      progress_stall_after_guidance: progress.stalledAfterGuidance,
+      compactions: progress.compactions,
+      compactions_since_mutation: progress.compactionsSinceMutation,
+      mutation_events: progress.mutations,
+      seconds_since_mutation: progress.secondsSinceMutation,
+      implementation_phase_committed: progress.implementationPhaseCommitted,
+      implementation_phase_reentered: progress.implementationPhaseReentered,
+      post_compaction_rediscovery: progress.postCompactionRediscovery,
+      parent_guidance_messages: progress.guidanceMessages,
+      large_tool_outputs: progress.largeToolOutputs,
+      largest_tool_output_tokens: progress.largestToolOutputTokens,
+      largest_tool_output_source: progress.largestToolOutputSource,
+    },
     recent_summary: {
       reasoning_updates: result.recentSummary.reasoningUpdates,
       command_calls: result.recentSummary.commandCalls,
