@@ -17,7 +17,7 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 
 The watcher intentionally returns only a short recent window and truncates individual events so supervision costs far fewer parent-model tokens than replaying the full rollout.
 
-The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated premise reversals, repeated compaction, terminal errors, and conservative inactivity. One self-correction and up to an hour without persisted Qwen activity are not suspicious by themselves.
+The health operation does not attempt to judge whether the worker's engineering solution is correct. It looks only for observable behavior such as repeated commands, repeated failures, repeated explicit premise reversals, repeated compaction, terminal errors, and conservative inactivity. Bare discourse markers such as “wait” and “actually” are not reversals. One self-correction and up to an hour without persisted Qwen activity are not suspicious by themselves. Activity age uses the newest persisted rollout event timestamp when available and falls back to file mtime only when necessary.
 
 ## Cheap watchdog supervision
 
@@ -29,7 +29,9 @@ Sol
  └─ Luna: wait on Qwen, run compact health checks, stay silent while healthy
 ```
 
-Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`. Sol waits on Luna and does not inspect Qwen's trace during healthy intervals.
+Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Each MCP wait call is capped at a transport-safe four minutes; Luna quietly composes those chunks into the longer health window. Tool or transport failures do not count as missing-worker windows. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`. Sol waits on Luna and does not inspect Qwen's trace during healthy intervals.
+
+After escalation, inactivity alone is not grounds to abandon a worker. If detailed inspection still shows `running` with recent persisted activity, Sol keeps that worker unless there is an independent terminal, unreadable, error, or clear loop signal.
 
 The watchdog always uses the worker's exact thread ID. Provider and persisted cwd are informational and are not used as identity filters because rollout metadata can retain the parent launch cwd. Once Luna is running, it may be the newest child session, so `inspect_latest_v1_agent` is not safe for the worker in this flow.
 
