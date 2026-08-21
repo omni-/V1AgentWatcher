@@ -751,6 +751,11 @@ function isImplementationPhaseText(text) {
   return IMPLEMENTATION_PHASE_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+// Codex writes the pre-truncation size into the persisted output text, for
+// example "Original token count: 80219" or "truncated output (original token
+// count: 80219)". Both spellings resolve to the same authoritative number.
+const REPORTED_TOKEN_COUNT_PATTERN = /original token count:?\s*([0-9][0-9_,]*)/gi;
+
 function toolOutputText(payload) {
   const raw = payload.output ?? payload.result ?? payload.aggregated_output ?? payload.formatted_output ?? payload.stdout ?? '';
   if (typeof raw === 'string') return raw;
@@ -780,6 +785,17 @@ function toolOutputTokens(payload) {
 
   const text = toolOutputText(payload);
   if (!text) return null;
+
+  // Codex persists the pre-truncation size in the output body itself. The
+  // stored text is truncated, so estimating its length would badly understate a
+  // pathological result; the reported count is authoritative when present.
+  let reported = 0;
+  for (const match of text.matchAll(REPORTED_TOKEN_COUNT_PATTERN)) {
+    const value = Number(String(match[1]).replace(/[_,]/g, ''));
+    if (Number.isFinite(value) && value > reported) reported = value;
+  }
+  if (reported > 0) return { tokens: Math.round(reported), source: 'reported' };
+
   return { tokens: Math.ceil(text.length / ESTIMATED_CHARS_PER_TOKEN), source: 'estimated' };
 }
 
@@ -1060,8 +1076,13 @@ export function analyzeAgentHealth(lines, options = {}) {
     concernScore += 2;
   }
   if (facts.compactions >= 2) {
+    // Repeated compaction is reported but no longer escalates on its own.
+    // Compaction says nothing about progress by itself — a productive worker
+    // that edits between compactions is healthy. The mutation-aware
+    // progress_stall signal below carries the discriminating weight, and this
+    // fact still escalates when combined with any other independent signal.
     signals.push(`context_compaction: ${facts.compactions} recent compactions`);
-    concernScore += 2;
+    concernScore += 1;
   }
   if (investigationCount >= 15 && mutationCount === 0) {
     signals.push(`investigation_only: ${investigationCount} read/search calls without an observed write action`);

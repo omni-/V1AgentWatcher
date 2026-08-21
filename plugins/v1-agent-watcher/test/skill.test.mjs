@@ -48,14 +48,19 @@ test('a first progress stall continues the same worker and a repeated stall may 
   assert.match(skill, /Do not add progress polling/);
 });
 
-test('local-worker spawns do not request an unsupported granular reasoning level', async () => {
+test('local-worker reasoning documents inheritance rather than claiming omission suppresses the warning', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 
   assert.match(skill, /Do not pass an explicit granular `reasoning_effort` when the worker runs on a local OpenAI-compatible provider/);
-  assert.match(skill, /Omit `reasoning_effort` in the spawn call so no unsupported value is forwarded/);
-  assert.match(skill, /Reasoning stays enabled through the provider's own fallback/);
-  assert.match(skill, /treat the chosen level as not honored/);
+  // V1 declares `Omit to inherit the parent effort`, so omission still forwards
+  // a granular value. The contract must not claim otherwise.
+  assert.match(skill, /\*\*Omitting `reasoning_effort` does not avoid this\.\*\*/);
+  assert.match(skill, /Omission inherits the parent's current effort/);
+  assert.match(skill, /The V1 effort enum has no provider-native `on` value/);
+  assert.match(skill, /the provider reports it as unsupported and falls back to `on`/);
+  assert.match(skill, /Omission is the honest default, not a fix for the warning/);
+  assert.equal(/omit[^.]{0,80}so no unsupported value is forwarded/i.test(skill), false);
   // The worker spawn contract must not name a granular level for the local worker.
-  const spawnContract = skill.slice(0, skill.indexOf('## Post-run accounting'));
+  const spawnContract = skill.slice(0, skill.indexOf('## Local-worker reasoning configuration'));
   assert.equal(/reasoning[_ ]effort\s*[:=]\s*"?(low|medium|high|xhigh)"?/i.test(spawnContract), false);
 });

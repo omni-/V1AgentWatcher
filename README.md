@@ -30,7 +30,9 @@ A worker can stay technically active — still reasoning, still calling tools �
 
 The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes.
 
-Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. `large_tool_output` is reported separately as a low-severity explanatory fact — tool results above roughly 20000 tokens, preferring persisted token metadata over a character estimate — and never escalates by itself.
+Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. Repeated compaction on its own no longer escalates either — a worker that edits between compactions is productive — so it is reported as a fact and escalates only alongside an independent signal.
+
+`large_tool_output` is reported separately as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate. Reading that header matters because the persisted body is truncated: estimating its stored length would put a 80k-token result well under the threshold.
 
 ## Cheap watchdog supervision
 
@@ -54,7 +56,9 @@ A `progress_stall` escalation follows the same principle. On the first stall Sol
 
 ### Local-worker reasoning levels
 
-The model catalog advertises `low`/`medium`/`high`/`xhigh` for local LM Studio workers, but a served model may support only `on` and `off` and will report the requested level as unsupported before falling back to `on`. The supervision skill therefore omits `reasoning_effort` when spawning a local-provider worker: reasoning stays enabled through the provider's fallback, and no unsupported value is forwarded. Where a spawn interface forces a generic effort enum, treat the level as not honored rather than reporting the run as, for example, a “medium-effort” run.
+The model catalog advertises `low`/`medium`/`high`/`xhigh` for local LM Studio workers, but a served model may support only `on` and `off` and will report the requested level as unsupported before falling back to `on`.
+
+Omitting `reasoning_effort` does not avoid that. V1 declares the field as “omit to inherit the parent effort”, and persisted rollouts confirm it: a spawn passing no `reasoning_effort` produced a worker whose `turn_context` recorded the parent's own `medium`. The enum has no provider-native `on` value, so no spawn setting can request what the model actually supports. The skill still omits the field — deliberately naming an unsupported level adds nothing — but documents the limitation instead of claiming omission suppresses the warning. Reasoning stays enabled through the provider's fallback; the level is not honored, so a run should never be described as, for example, a “medium-effort” run.
 
 The watchdog always uses the worker's exact thread ID. Provider and persisted cwd are informational and are not used as identity filters because rollout metadata can retain the parent launch cwd. Once Luna is running, it may be the newest child session, so `inspect_latest_v1_agent` is not safe for the worker in this flow.
 

@@ -9,7 +9,7 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
 
 ## Required architecture
 
-1. Spawn the real V1 worker and retain its exact thread ID. Do not pass an explicit granular `reasoning_effort` when the worker runs on a local OpenAI-compatible provider such as `lmstudio`; omit the field and let the worker's own configuration decide. See "Local-worker reasoning configuration" below.
+1. Spawn the real V1 worker and retain its exact thread ID. Do not pass an explicit granular `reasoning_effort` when the worker runs on a local OpenAI-compatible provider such as `lmstudio`. Note that omitting it inherits the parent effort rather than suppressing the provider's unsupported-setting fallback. See "Local-worker reasoning configuration" below.
 2. Spawn one watchdog with:
    - model `gpt-5.6-luna`
    - low reasoning effort
@@ -45,13 +45,22 @@ The Codex model catalog advertises `low`/`medium`/`high`/`xhigh` for local LM St
 Reasoning setting 'medium' is not supported by model '...'. Supported settings: 'on', 'off'. Falling back to reasoning setting 'on'.
 ```
 
-Consequences for supervision and benchmarking:
+**Omitting `reasoning_effort` does not avoid this.** The V1 spawn interface declares:
 
-- Do not select a granular effort level for a local worker. Omit `reasoning_effort` in the spawn call so no unsupported value is forwarded.
-- Reasoning stays enabled through the provider's own fallback; omission does not disable it.
-- The local catalog entry for the Qwen worker has no `default_reasoning_level`, so an omitted effort resolves from the local Codex configuration rather than from a model-specific default.
-- If the spawn interface forces a generic effort enum with no way to request provider-native `on`, treat the chosen level as not honored. Report it as unsupported/fallback rather than describing the run as, for example, a "medium-effort" run.
-- Do not tune a local worker by changing this level; it is not a meaningful control for such a model. Luna's own reasoning configuration is unrelated and stays as it is.
+```ts
+// Reasoning effort override for the new agent. Omit to inherit the parent effort.
+reasoning_effort?: string;
+```
+
+Omission inherits the parent's current effort, and the inherited granular value is forwarded to the provider like any explicit one. Persisted rollouts confirm it: a spawn that passed no `reasoning_effort` produced a worker whose `turn_context` recorded the parent's own `"effort":"medium"`.
+
+The accurate statement of the limitation:
+
+- The V1 effort enum has no provider-native `on` value, so no spawn setting can request what this model actually supports.
+- Whatever granular level arrives — explicit or inherited — the provider reports it as unsupported and falls back to `on`. That warning is expected for this worker and is not a supervision fault.
+- Reasoning therefore remains enabled, but the level is not honored and is not a meaningful control for this model.
+- Still omit `reasoning_effort` for a local worker: deliberately naming an unsupported level adds nothing. Omission is the honest default, not a fix for the warning.
+- Never describe such a run as, for example, a "medium-effort" run, and do not tune a local worker by changing this level. Luna's own reasoning configuration is unrelated and stays as it is.
 
 ## Post-run accounting
 
@@ -165,7 +174,9 @@ Activity age comes from the newest parseable persisted `event_msg` or `response_
 
 The health result also reports the supporting facts: `compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, and `progress_stall_after_guidance`.
 
-One compaction, one long inference, a clean worktree before implementation begins, and one huge tool result are each insufficient alone and deliberately do not escalate. `large_tool_output` is reported as a low-severity explanatory fact — it counts tool results above roughly 20000 tokens, preferring persisted token metadata over a character estimate — and never escalates by itself.
+One compaction, one long inference, a clean worktree before implementation begins, and one huge tool result are each insufficient alone and deliberately do not escalate. Repeated compaction alone is also insufficient now that progress_stall is the discriminating signal: it is reported, and escalates only when an independent signal corroborates it.
+
+`large_tool_output` is reported as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate — the persisted body is truncated, so its stored length understates a pathological result.
 
 ## Steering after escalation
 

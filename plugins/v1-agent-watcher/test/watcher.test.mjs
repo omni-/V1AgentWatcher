@@ -405,15 +405,25 @@ test('repeated premise reversals can trigger suspicion', () => {
   assert.ok(health.signals.some((signal) => signal.startsWith('premise_reversals:')));
 });
 
-test('repeated context compaction is surfaced as a health signal', () => {
-  const health = analyzeAgentHealth([
+test('repeated context compaction is surfaced but no longer escalates on its own', () => {
+  const lines = [
     JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
     JSON.stringify({ type: 'event_msg', payload: { type: 'context_compacted' } }),
     JSON.stringify({ type: 'event_msg', payload: { type: 'context_compacted' } }),
-  ], { agent: { agentNickname: 'qwen' }, secondsSinceActivity: 30 });
+  ];
+  const health = analyzeAgentHealth(lines, { agent: { agentNickname: 'qwen' }, secondsSinceActivity: 30 });
 
-  assert.equal(health.health, 'suspicious');
   assert.ok(health.signals.some((signal) => signal.startsWith('context_compaction:')));
+  assert.equal(health.health, 'healthy');
+
+  // It still escalates as soon as any independent signal corroborates it.
+  const corroborated = analyzeAgentHealth([
+    ...lines,
+    JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'My earlier assumption was wrong.' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'That premise does not hold.' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'Our previous approach was mistaken.' } }),
+  ], { agent: { agentNickname: 'qwen' }, secondsSinceActivity: 30 });
+  assert.equal(corroborated.health, 'suspicious');
 });
 
 test('repeated failed commands are distinguished from repeated successful commands', () => {
@@ -739,4 +749,71 @@ test('a compaction bridge summary is not counted as parent guidance', () => {
   ]);
 
   assert.equal(facts.guidanceMessages, 0);
+});
+
+test('a truncated tool result reports its persisted original token count instead of a length estimate', () => {
+  // Real persisted shape: the body is truncated, so its stored length is far
+  // below the pathological original size Codex reports in the header.
+  const truncated = [
+    'Original token count: 80219',
+    'Output:',
+    'Warning: truncated output (original token count: 80219)',
+    'src/Foo.cs',
+    'src/Bar.cs',
+  ].join('\n');
+
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'exec_command_begin', call_id: 'c1', command: ['get-childitem', '-recurse', '.'] }),
+    event('event_msg', { type: 'exec_command_end', call_id: 'c1', exit_code: 0, aggregated_output: truncated }),
+  ]);
+
+  assert.equal(facts.largestToolOutputTokens, 80219);
+  assert.equal(facts.largestToolOutputSource, 'reported');
+  assert.equal(facts.largeToolOutputs, 1);
+});
+
+test('a truncated function_call_output header is read the same way', () => {
+  const facts = collectProgressFacts([
+    event('response_item', {
+      type: 'function_call_output',
+      call_id: 'c1',
+      output: 'Warning: truncated output (Original token count: 512340)\nfirst line\nsecond line',
+    }),
+  ]);
+
+  assert.equal(facts.largestToolOutputTokens, 512340);
+  assert.equal(facts.largestToolOutputSource, 'reported');
+});
+
+test('a small ordinary tool result is still estimated and stays below the threshold', () => {
+  const facts = collectProgressFacts([
+    event('response_item', { type: 'function_call_output', call_id: 'c1', output: 'two matching files' }),
+  ]);
+
+  assert.equal(facts.largeToolOutputs, 0);
+  assert.equal(facts.largestToolOutputSource, 'estimated');
+});
+
+test('two compactions with an intervening mutation remain healthy', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }),
+    reasoningLine('My implementation plan is to drop responses whose request token is stale.', '2026-08-20T09:00:00Z'),
+    compactionLine('2026-08-20T09:10:00Z'),
+    patchLine('c1', '2026-08-20T09:15:00Z'),
+    compactionLine('2026-08-20T09:30:00Z'),
+    shellLine('c2', ['dotnet', 'test']),
+    reasoningLine('The focused tests pass; tightening the guard next.', '2026-08-20T09:35:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:36:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.stalled, false);
+  assert.equal(health.progress.compactions, 2);
+  assert.equal(health.progress.compactionsSinceMutation, 1);
+  assert.equal(health.progress.secondsSinceMutation, 1260);
 });
