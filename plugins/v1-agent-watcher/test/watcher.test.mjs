@@ -8,7 +8,9 @@ import {
   inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
+  normalizeWaitTimeoutMs,
   summarizeRolloutLines,
+  TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
   waitForAgent,
 } from '../mcp/watcher.mjs';
 
@@ -112,6 +114,40 @@ test('chooses the most recently updated matching child and honors parent/provide
   assert.equal(await inspectAgentSession({ codexHome: root, provider: 'openai' }), null);
 });
 
+test('fresh persisted events override a stale rollout file mtime for inactivity', async (t) => {
+  const root = await temporaryCodexHome(t);
+  const nowMs = Date.parse('2026-08-20T09:00:18Z');
+  const file = await makeRollout(root, 'rollout-stale-mtime.jsonl', v1ChildMeta({ id: 'fresh-worker' }), [
+    { timestamp: '2026-08-20T09:00:00Z', type: 'event_msg', payload: { type: 'task_started' } },
+    { timestamp: '2026-08-20T09:00:00Z', type: 'event_msg', payload: { type: 'agent_reasoning', text: 'Fresh persisted work.' } },
+  ]);
+  const staleMtime = new Date(nowMs - 1898 * 1000);
+  await fs.utimes(file, staleMtime, staleMtime);
+
+  const inspection = await inspectAgentSession({ codexHome: root, threadId: 'fresh-worker', nowMs });
+  const health = await inspectAgentHealth({ codexHome: root, threadId: 'fresh-worker', nowMs });
+
+  assert.equal(inspection.secondsSinceActivity, 18);
+  assert.equal(inspection.activitySource, 'persisted_event');
+  assert.equal(health.secondsSinceActivity, 18);
+  assert.equal(health.activitySource, 'persisted_event');
+  assert.equal(health.health, 'healthy');
+});
+
+test('rollout mtime remains the activity fallback when events have no usable timestamps', async (t) => {
+  const root = await temporaryCodexHome(t);
+  const nowMs = Date.parse('2026-08-20T09:00:18Z');
+  const file = await makeRollout(root, 'rollout-mtime-fallback.jsonl', v1ChildMeta({ id: 'fallback-worker' }), [
+    { type: 'event_msg', payload: { type: 'task_started' } },
+  ]);
+  const mtime = new Date(nowMs - 30 * 1000);
+  await fs.utimes(file, mtime, mtime);
+
+  const inspection = await inspectAgentSession({ codexHome: root, threadId: 'fallback-worker', nowMs });
+  assert.equal(inspection.secondsSinceActivity, 30);
+  assert.equal(inspection.activitySource, 'file_mtime');
+});
+
 test('nickname and role filters resolve the intended latest child', async (t) => {
   const root = await temporaryCodexHome(t);
   await makeRollout(root, 'rollout-worker.jsonl', v1ChildMeta({ id: 'worker', agent_nickname: 'qwen' }));
@@ -189,6 +225,12 @@ test('persisted-rollout wait times out without treating a missing session as ter
   assert.equal(result.outcome, 'timeout');
   assert.equal(result.state, 'missing');
   assert.equal(result.found, false);
+});
+
+test('persisted-rollout waits clamp oversized requests to a transport-safe chunk', () => {
+  assert.equal(TRANSPORT_SAFE_WAIT_TIMEOUT_MS, 240000);
+  assert.equal(normalizeWaitTimeoutMs(900000), TRANSPORT_SAFE_WAIT_TIMEOUT_MS);
+  assert.equal(normalizeWaitTimeoutMs(60000), 60000);
 });
 
 test('persisted-rollout wait reports worker terminal errors immediately', async (t) => {
@@ -322,6 +364,20 @@ test('one self-correction and Qwen slowness alone remain healthy', () => {
   assert.equal(health.state, 'running');
   assert.equal(health.health, 'healthy');
   assert.deepEqual(health.signals, []);
+});
+
+test('ordinary wait discourse markers do not count as premise reversals', () => {
+  const lines = [
+    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'Wait — this event handler needs to be a method.' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'Wait for the callback before reading the state.' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'agent_reasoning', text: 'Actually, this helper belongs beside the parser.' } }),
+  ];
+
+  const health = analyzeAgentHealth(lines, { agent: { agentNickname: 'qwen' }, secondsSinceActivity: 30 });
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.recentSummary.reasoningUpdates, 3);
+  assert.equal(health.signals.some((signal) => signal.startsWith('premise_reversals:')), false);
 });
 
 test('Qwen inactivity becomes suspicious only after one hour', () => {

@@ -10,7 +10,8 @@ const DEFAULT_READ_BYTES = 8 * 1024 * 1024;
 const MAX_READ_CACHE_ENTRIES = 8;
 const HEALTH_EVENT_LIMIT = 100;
 const HEALTH_TEXT_LIMIT = 1200;
-const DEFAULT_WAIT_TIMEOUT_MS = 15 * 60 * 1000;
+export const TRANSPORT_SAFE_WAIT_TIMEOUT_MS = 4 * 60 * 1000;
+const DEFAULT_WAIT_TIMEOUT_MS = TRANSPORT_SAFE_WAIT_TIMEOUT_MS;
 const DEFAULT_WAIT_POLL_INTERVAL_MS = 5000;
 
 const recentRolloutCache = new Map();
@@ -391,6 +392,32 @@ function summarizeResponseItem(record, textLimit) {
   }
 }
 
+function latestPersistedActivityMs(lines) {
+  let latest = null;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (record.type !== 'event_msg' && record.type !== 'response_item') continue;
+    const timestampMs = Date.parse(record.timestamp);
+    if (Number.isFinite(timestampMs) && (latest === null || timestampMs > latest)) latest = timestampMs;
+  }
+  return latest;
+}
+
+function rolloutActivity(lines, fallbackMs) {
+  const persistedEventMs = latestPersistedActivityMs(lines);
+  const timestampMs = persistedEventMs ?? fallbackMs;
+  return {
+    timestampMs,
+    source: persistedEventMs === null ? 'file_mtime' : 'persisted_event',
+  };
+}
+
 function reasoningDelta(payload, prefix, indexField) {
   if (!payload.delta) return null;
   const partIndex = payload[indexField] ?? 0;
@@ -720,8 +747,16 @@ export function analyzeAgentHealth(lines, options = {}) {
   const facts = collectHealthFacts(currentTurnLines);
   const malformedLines = countMalformedLines(lines);
   const reasoningEvents = summary.events.filter((event) => event.kind === 'reasoning');
-  const reversalPattern = /\b(?:wait|actually|hold on|reconsider|that's wrong|that is wrong|i was wrong|scratch that)\b/i;
-  const reversalCount = reasoningEvents.filter((event) => reversalPattern.test(event.text)).length;
+  const reversalPatterns = [
+    /\b(?:i|we)\s+(?:was|were|am|are)\s+(?:wrong|mistaken)\b/i,
+    /\b(?:scratch|forget)\s+(?:that|the\s+(?:earlier|previous|prior)\s+(?:approach|plan|idea))\b/i,
+    /\b(?:that's|that\s+(?:is|was)|this\s+(?:is|was))\s+(?:wrong|incorrect|mistaken|false)\b/i,
+    /\b(?:my|our|the)\s+(?:earlier|previous|prior|initial|original)\s+(?:assumption|premise|approach|plan|conclusion|interpretation|branch|theory|idea)\s+(?:is|was|seems?|turned\s+out\s+to\s+be)\s+(?:wrong|incorrect|mistaken|false|invalid|flawed)\b/i,
+    /\b(?:that|this|my|our|the\s+(?:earlier|previous|prior|initial|original))\s+(?:assumption|premise)\s+(?:does\s+not|doesn't|did\s+not|didn't|cannot|can't)\s+(?:hold|work|apply)\b/i,
+  ];
+  const reversalCount = reasoningEvents.filter((event) =>
+    reversalPatterns.some((pattern) => pattern.test(event.text))
+  ).length;
   const repeatedCommands = repeatedGroup(facts.commands);
   const failedCommands = facts.commands.filter((command) => command.failed);
   const repeatedFailures = repeatedGroup(failedCommands);
@@ -828,15 +863,17 @@ export async function inspectAgentSession(options = {}) {
 
   const summary = summarizeRolloutLines(recent.lines, { ...options, initialStatus: recent.entry.status });
   recent.entry.status = summary.status;
+  const activity = rolloutActivity(recent.lines, recent.stat.mtimeMs);
   const currentAgent = {
     ...agent,
-    updatedAt: recent.stat.mtime.toISOString(),
-    updatedAtMs: recent.stat.mtimeMs,
+    updatedAt: new Date(activity.timestampMs).toISOString(),
+    updatedAtMs: activity.timestampMs,
   };
   return {
     agent: currentAgent,
     status: summary.status,
     secondsSinceActivity: Math.max(0, Math.round(((options.nowMs ?? Date.now()) - currentAgent.updatedAtMs) / 1000)),
+    activitySource: activity.source,
     events: summary.events,
   };
 }
@@ -862,10 +899,11 @@ async function inspectResolvedAgentHealth(agent, options = {}) {
     };
   }
 
+  const activity = rolloutActivity(recent.lines, recent.stat.mtimeMs);
   const currentAgent = {
     ...agent,
-    updatedAt: recent.stat.mtime.toISOString(),
-    updatedAtMs: recent.stat.mtimeMs,
+    updatedAt: new Date(activity.timestampMs).toISOString(),
+    updatedAtMs: activity.timestampMs,
   };
   const secondsSinceActivity = Math.max(0, Math.round(((options.nowMs ?? Date.now()) - currentAgent.updatedAtMs) / 1000));
   const analysis = analyzeAgentHealth(recent.lines, {
@@ -876,7 +914,7 @@ async function inspectResolvedAgentHealth(agent, options = {}) {
   });
   recent.entry.status = analysis.state;
 
-  return { agent: currentAgent, secondsSinceActivity, ...analysis };
+  return { agent: currentAgent, secondsSinceActivity, activitySource: activity.source, ...analysis };
 }
 
 export async function inspectAgentHealth(options = {}) {
@@ -888,10 +926,20 @@ function waitDelay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+export function normalizeWaitTimeoutMs(value, maximum = TRANSPORT_SAFE_WAIT_TIMEOUT_MS) {
+  const maximumTimeoutMs = clampInt(
+    maximum,
+    1,
+    TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+    TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+  );
+  return clampInt(value, 1, maximumTimeoutMs, Math.min(DEFAULT_WAIT_TIMEOUT_MS, maximumTimeoutMs));
+}
+
 export async function waitForAgent(options = {}) {
   if (!options.threadId) throw new Error('threadId is required');
 
-  const timeoutMs = clampInt(options.timeoutMs, 1, 3_600_000, DEFAULT_WAIT_TIMEOUT_MS);
+  const timeoutMs = normalizeWaitTimeoutMs(options.timeoutMs, options.maximumTimeoutMs);
   const pollIntervalMs = clampInt(
     options.pollIntervalMs,
     1,
@@ -996,6 +1044,7 @@ export function formatHealthInspection(result) {
     state: result.state,
     health: result.health,
     seconds_since_activity: result.secondsSinceActivity,
+    activity_source: result.activitySource,
     signals: result.signals,
     recent_summary: {
       reasoning_updates: result.recentSummary.reasoningUpdates,

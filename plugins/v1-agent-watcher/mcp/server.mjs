@@ -7,6 +7,7 @@ import {
   inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
+  TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
   waitForAgent,
 } from './watcher.mjs';
 import {
@@ -14,7 +15,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.5.0' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.1' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -37,7 +38,13 @@ const TOOLS = [
       type: 'object',
       properties: {
         thread_id: { type: 'string', description: 'Exact worker thread ID.' },
-        timeout_ms: { type: 'integer', minimum: 1, maximum: 3600000, default: 900000 },
+        timeout_ms: {
+          type: 'integer',
+          minimum: 1,
+          maximum: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+          default: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+          description: 'One transport-safe wait chunk. Compose chunks in the watchdog for longer health cadences.',
+        },
       },
       required: ['thread_id'],
       additionalProperties: false,

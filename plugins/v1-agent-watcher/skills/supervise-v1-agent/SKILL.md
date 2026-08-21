@@ -15,10 +15,12 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
    - low reasoning effort
    - no forked parent context when the spawn API exposes that choice
    - the exact worker thread ID and worker kind (`qwen`, `ornith`, or unknown) in its initial message
-3. Wait on the watchdog, not the worker. Use the native V1 `wait_agent` with the watchdog thread ID and a long timeout, up to 3,600,000 ms when supported. The wait returns early when the watchdog finishes. If that outer wait itself times out, wait on the same watchdog again without inspecting the worker.
+3. Wait on the watchdog, not the worker. Call the native V1 `wait_agent` on the watchdog thread and explicitly set `timeout_ms=3600000`; do not rely on the tool's default timeout. The wait returns early when the watchdog finishes. If that outer wait times out without a terminal watchdog result, immediately call `wait_agent` again on the same watchdog with `timeout_ms=3600000`. Between healthy outer waits, do not inspect the worker or watchdog, emit progress commentary, summarize status, or perform any other parent work.
 4. The watchdog stays silent while the worker is healthy. It returns only when the worker completes or observable behavior warrants parent attention.
-5. After `DONE`, the parent reviews the worker's final changes normally. After `NEEDS_SOL_REVIEW`, the parent may call `inspect_v1_agent` for a small detailed window and decide whether queued guidance is needed.
+5. After `DONE`, the parent reviews the worker's final changes normally. After `NEEDS_SOL_REVIEW`, the parent may call `inspect_v1_agent` for a small detailed window and decide whether queued guidance is needed. A worker that is still `running` with recent persisted activity must be preserved unless inspection also shows an independent concrete terminal, error, unreadable, or repeated-loop signal.
 6. Retain the exact worker and watchdog thread IDs in the final report so the human can measure the completed run afterward with `v1usage -Worker <worker-id> -Watchdog <watchdog-id>`.
+
+After the watchdog is spawned, the parent must remain silent until the watchdog returns `DONE` or `NEEDS_SOL_REVIEW`, the user provides new input, or an actual tool/runtime error requires parent action. A healthy `wait_agent` timeout is not a progress event and must not produce a parent update; re-enter the same explicit one-hour wait immediately.
 
 Always address the worker by exact `thread_id`. A watchdog is itself a child rollout and may be newer than the worker, so latest-session selection is unsafe after the watchdog has been spawned.
 
@@ -54,13 +56,16 @@ Use only:
 Do not call inspect_v1_agent unless the parent later asks you to do so.
 
 Loop internally:
-- Call `wait_v1_agent` with 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker. It returns early if persisted rollout state becomes terminal.
+- Use a health window of 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker.
+- Build that health window from transport-safe `wait_v1_agent` calls of at most 240000 ms. Use the smaller of 240000 ms and the remaining health-window duration. These are quiet wait chunks, not health-poll boundaries.
 - If `wait_v1_agent` reports `completed`, return exactly:
   DONE: worker completed
 - If `wait_v1_agent` reports `terminal_error`, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence describing that observable state>
-- A timeout with `found=false` can be a persistence/indexing race. Retry the full persisted-rollout wait. Escalate only after three consecutive full timeout windows without finding the exact thread.
-- After a timeout with `found=true`, call inspect_v1_agent_health for the exact worker thread.
+- Only a returned `outcome: timeout` is a completed wait chunk. Add its actual `waitedMs` to the current health window. A tool exception, MCP failure, or transport timeout contributes zero elapsed wait evidence, says nothing about worker presence or health, and must never increment the missing-worker count.
+- Retry a failed transport chunk. If three consecutive transport/tool failures prevent observation, return `NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts`; do not describe the worker as missing or unhealthy.
+- Do not inspect health until completed timeout chunks accumulate one full health window. If every completed chunk in that full window has `found=false`, count one full missing window. Escalate only after three consecutive full missing windows.
+- If any completed chunk in the full window has `found=true`, reset the missing-window count and call inspect_v1_agent_health for the exact worker thread.
 - If state is idle/completed, return exactly:
   DONE: worker completed
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
@@ -68,7 +73,7 @@ Loop internally:
   NEEDS_SOL_REVIEW: <one concise sentence copied or summarized only from the observable health signal>
 - Provider and cwd values are diagnostic context, not identity constraints. Persisted cwd can reflect the parent launch context even when the worker correctly changed its shell cwd.
 - A single self-correction is normal. Qwen producing no new persisted output for up to one hour can still be normal model inference and is not suspicious by itself.
-- If the watcher cannot inspect the exact thread three times in succession, with a full wait between attempts, return NEEDS_SOL_REVIEW with that observable failure.
+- If health inspection itself cannot inspect the exact thread, wait another full health window before retrying. Escalate only after three such full-window inspection failures, and describe the inspection failure rather than claiming the worker is unhealthy.
 
 Do not emit periodic progress updates. Continue until one terminal line above can be returned.
 ```
@@ -79,9 +84,13 @@ Do not emit periodic progress updates. Continue until one terminal line above ca
 
 Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, and terminal error/abort states. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
 
+Activity age comes from the newest parseable persisted `event_msg` or `response_item` timestamp. Rollout file mtime is only a fallback because Windows can leave mtime stale while a process holds and appends the JSONL. Premise-reversal screening requires explicit backtracking language; ordinary discourse markers such as bare “wait” or “actually” are not reversals.
+
 ## Steering after escalation
 
 If the parent determines that ordinary technical guidance is needed, send one concise correction through V1 `send_input` with `interrupt=false`, or omit the flag only when omission means queued input. Prefer a factual constraint or concrete next action.
+
+An inactivity-only or watchdog-transport escalation is a request to inspect, not permission to abandon the worker. If detailed inspection shows `state: running` and recent persisted activity below the applicable inactivity threshold, keep the existing worker. Replace or interrupt only when there is separate concrete evidence such as a terminal abort/error, an unreadable rollout that prevents safe supervision, or a clear repeated loop/failure pattern. Do not weaken those terminal and loop cases.
 
 Do not use `interrupt=true` for normal supervision. In V1 it aborts the active child turn and can leave external-provider workers stopped. Reserve interruption for intentional cancellation. If a worker must be abandoned, close it and spawn a replacement with the corrected premise in its initial task.
 
