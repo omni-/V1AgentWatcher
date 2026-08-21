@@ -1141,3 +1141,117 @@ test('an apply_patch tool call is still the canonical mutation evidence', () => 
   assert.equal(facts.currentTurnMutations, 1);
   assert.equal(facts.currentTurnInvestigations, 0);
 });
+
+// The real persisted framework preamble. Codex writes one before the delegated
+// task and another on each continuation turn.
+function environmentContextLine(timestamp, cwd = 'C:\\repo') {
+  return userLine([
+    '<environment_context>',
+    `  <cwd>${cwd}</cwd>`,
+    '  <approval_policy>on-request</approval_policy>',
+    '  <sandbox_mode>workspace-write</sandbox_mode>',
+    '  <shell>pwsh</shell>',
+    '</environment_context>',
+  ].join('\n'), timestamp);
+}
+
+test('a framework environment_context message does not make the delegated task look like guidance', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    environmentContextLine('2026-08-20T09:00:01Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:02Z'),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:01:00Z'),
+    shellLine('c2', ['rg', 'incSeason', 'src'], '2026-08-20T09:02:00Z'),
+    shellLine('c3', ['get-childitem', 'tests'], '2026-08-20T09:03:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:04:00Z') });
+
+  assert.equal(facts.guidanceMessages, 0);
+  assert.equal(facts.postGuidanceStall, false);
+  assert.equal(facts.stalledAfterGuidance, false);
+  assert.equal(facts.investigationsSinceGuidance, 0);
+});
+
+test('real parent guidance after a continuation environment_context is exactly one guidance event', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    environmentContextLine('2026-08-20T09:00:01Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:02Z'),
+    event('event_msg', { type: 'task_complete' }, '2026-08-20T09:09:00Z'),
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:10:00Z'),
+    environmentContextLine('2026-08-20T09:10:01Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:10:02Z'),
+    shellLine('g1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:11:00Z'),
+    shellLine('g2', ['rg', 'incSeason', 'src'], '2026-08-20T09:12:00Z'),
+    shellLine('g3', ['get-childitem', 'tests'], '2026-08-20T09:13:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:14:00Z') });
+
+  assert.equal(facts.guidanceMessages, 1);
+  assert.equal(facts.postGuidanceStall, true);
+  assert.equal(facts.investigationsSinceGuidance, 3);
+  assert.equal(facts.mutationsSinceGuidance, 0);
+});
+
+test('an environment_context persisted as an event_msg user_message is ignored the same way', () => {
+  const environmentContext = '<environment_context>\n  <cwd>C:\\repo</cwd>\n</environment_context>';
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    event('event_msg', { type: 'user_message', message: environmentContext }, '2026-08-20T09:00:01Z'),
+    event('event_msg', { type: 'user_message', message: 'Fix the stale leaderboard row.' }, '2026-08-20T09:00:02Z'),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:01:00Z'),
+    shellLine('c2', ['rg', 'incSeason', 'src'], '2026-08-20T09:02:00Z'),
+    shellLine('c3', ['get-childitem', 'tests'], '2026-08-20T09:03:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:04:00Z') });
+
+  assert.equal(facts.guidanceMessages, 0);
+  assert.equal(facts.postGuidanceStall, false);
+});
+
+test('compaction bridge handling survives the environment_context filter', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    environmentContextLine('2026-08-20T09:00:01Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:02Z'),
+    compactionLine('2026-08-20T09:20:00Z'),
+    userLine('Summary of the previous session: the callback drops nothing yet.', '2026-08-20T09:20:01Z'),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:21:00Z'),
+    shellLine('c2', ['rg', 'incSeason', 'src'], '2026-08-20T09:22:00Z'),
+    shellLine('c3', ['get-childitem', 'tests'], '2026-08-20T09:23:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:24:00Z') });
+
+  assert.equal(facts.compactions, 1);
+  assert.equal(facts.guidanceMessages, 0);
+  assert.equal(facts.postGuidanceStall, false);
+});
+
+test('the pre-mutation stall escalates for Qwen but not for other worker kinds', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(10, 'p', '2026-08-20T09:02:00Z'),
+  ];
+  const options = { secondsSinceActivity: 30, nowMs: Date.parse('2026-08-20T09:20:00Z') };
+
+  const qwen = analyzeAgentHealth(lines, { ...options, agent: { agentNickname: 'qwen' } });
+  assert.equal(qwen.health, 'suspicious');
+  assert.ok(qwen.signals.some((signal) => signal.startsWith('pre_mutation_stall:')));
+
+  for (const agent of [{ agentNickname: 'ornith' }, { agentRole: 'reviewer' }, undefined]) {
+    const other = analyzeAgentHealth(lines, { ...options, agent });
+    assert.equal(other.health, 'healthy');
+    assert.equal(other.signals.some((signal) => signal.startsWith('pre_mutation_stall:')), false);
+    // The deterministic fact is still reported; only the escalation is gated.
+    assert.equal(other.progress.preMutationStall, true);
+  }
+});
+
+test('a Qwen worker identified by role or agent path still escalates the pre-mutation stall', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(10, 'p', '2026-08-20T09:02:00Z'),
+  ];
+  const options = { secondsSinceActivity: 30, nowMs: Date.parse('2026-08-20T09:20:00Z') };
+
+  for (const agent of [{ agentRole: 'Qwen' }, { agentPath: 'C:\\agents\\qwen3-coder.toml' }]) {
+    const health = analyzeAgentHealth(lines, { ...options, agent });
+    assert.ok(health.signals.some((signal) => signal.startsWith('pre_mutation_stall:')));
+  }
+});

@@ -187,13 +187,15 @@ Compaction is recognized from every persisted spelling, including a top-level `{
 2. zero repository mutations in that turn;
 3. at least 10 investigation/read/search calls in that turn.
 
+Its thresholds are calibrated on Qwen benchmark traces, so only a Qwen worker escalates on it. For Ornith and unknown local workers the fact is still reported and the result stays healthy on that signal alone.
+
 Any repository mutation in the current turn clears it. Command classification normalizes the persisted command first — the tool prefix, an explicit shell wrapper (`pwsh -Command ...`), and the PowerShell call operator (`& rg ...`) are all stripped — so none of those wrappers hides a read/search call.
 
 ### post_guidance_stall
 
 `post_guidance_stall` applies once the parent has already told the worker to implement. It also requires no compaction:
 
-1. parent guidance occurred (a later user message that is not the delegated task and not a compaction bridge summary);
+1. parent guidance occurred (a later user message that is not the delegated task, not a framework `<environment_context>` preamble, and not a compaction bridge summary);
 2. zero repository mutations since that guidance;
 3. at least 3 investigation/read/search calls since that guidance.
 

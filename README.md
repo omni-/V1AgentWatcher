@@ -38,13 +38,15 @@ Two further stall signals catch the pattern that survives a tool-output token ca
 2. zero repository mutations in that turn;
 3. at least 10 investigation/read/search calls in that turn.
 
+Its thresholds come from Qwen benchmark traces, so only a Qwen worker escalates on it; for Ornith and unknown local workers the fact is reported without making the result suspicious.
+
 `post_guidance_stall` applies once the parent has already told the worker to implement, where action is expected quickly, and requires all of:
 
-1. parent guidance occurred (a later user message that is neither the delegated task nor a compaction bridge summary);
+1. parent guidance occurred (a later user message that is not the delegated task, not a framework `<environment_context>` preamble, and not a compaction bridge summary);
 2. zero repository mutations since that guidance;
 3. at least 3 investigation/read/search calls since that guidance.
 
-Any repository mutation clears the corresponding stall, and only the newest guidance is in scope so earlier guidance cannot poison later work. Persisted commands are normalized before classification — the tool prefix, an explicit shell wrapper (`pwsh -Command ...`), and the PowerShell call operator (`& rg ...`) are all stripped — so none of those wrappers hides a read/search call. Both signals report their supporting facts (`current_turn_seconds`, `current_turn_mutations`, `current_turn_investigations`, `mutations_since_guidance`, `investigations_since_guidance`). Neither shortens the supervision cadence: they are deterministic enough for the first scheduled health-window inspection to catch them.
+Any repository mutation clears the corresponding stall, and only the newest guidance is in scope so earlier guidance cannot poison later work. Codex persists a framework `<environment_context>` user message before the delegated task and on every continuation turn; those are filtered out first, so the delegated task itself is never mistaken for parent guidance. Persisted commands are normalized before classification — the tool prefix, an explicit shell wrapper (`pwsh -Command ...`), and the PowerShell call operator (`& rg ...`) are all stripped — so none of those wrappers hides a read/search call. Both signals report their supporting facts (`current_turn_seconds`, `current_turn_mutations`, `current_turn_investigations`, `mutations_since_guidance`, `investigations_since_guidance`). Neither shortens the supervision cadence: they are deterministic enough for the first scheduled health-window inspection to catch them.
 
 Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. Repeated compaction on its own no longer escalates either — a worker that edits between compactions is productive — so it is reported as a fact and escalates only alongside an independent signal.
 

@@ -90,3 +90,11 @@ test('the supervision cadence is unchanged by the new stall signals', async () =
   assert.match(skill, /do not shorten the window or add extra polling to find them sooner/);
   assert.match(skill, /Do not add progress polling/);
 });
+
+test('the contract scopes the pre-mutation stall to Qwen and excludes framework preambles from guidance', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /only a Qwen worker escalates on it/);
+  assert.match(skill, /For Ornith and unknown local workers the fact is still reported/);
+  assert.match(skill, /not a framework `<environment_context>` preamble/);
+});

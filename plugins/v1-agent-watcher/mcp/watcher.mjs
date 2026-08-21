@@ -21,6 +21,11 @@ const ESTIMATED_CHARS_PER_TOKEN = 4;
 const PROGRESS_STALL_COMPACTIONS = 2;
 const PROGRESS_STALL_REDISCOVERY_COMMANDS = 3;
 const COMPACTION_BRIDGE_RECORDS = 3;
+// Codex persists a framework-authored `<environment_context>` user message
+// before the delegated task and again on continuation turns. It is not a person
+// speaking, so it must neither consume the "first user message is the delegated
+// task" slot nor register as parent guidance.
+const ENVIRONMENT_CONTEXT_PATTERN = /^<environment_context>/i;
 const COMPACTION_EVENT_TYPES = new Set([
   'context_compacted',
   'conversation_compacted',
@@ -948,6 +953,7 @@ export function collectProgressFacts(lines, options = {}) {
 
   const addUserMessage = (text, timestampMs) => {
     const normalized = normalizeText(text);
+    if (ENVIRONMENT_CONTEXT_PATTERN.test(normalized)) return;
     if (normalized && normalized === previousUserText) return;
     previousUserText = normalized;
     userMessages += 1;
@@ -1121,11 +1127,23 @@ function countMalformedLines(lines) {
   return count;
 }
 
-function inactivityThreshold(agent) {
-  const identity = [agent?.agentNickname, agent?.agentRole, agent?.agentPath]
+function workerIdentity(agent) {
+  return [agent?.agentNickname, agent?.agentRole, agent?.agentPath]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
+}
+
+// The pre-mutation thresholds are calibrated on Qwen benchmark traces. Ornith
+// and unknown local workers keep the v0.6.3 escalation set until their own
+// traces justify a threshold, so the fact is still reported for them but does
+// not escalate.
+function isQwenWorker(agent) {
+  return workerIdentity(agent).includes('qwen');
+}
+
+function inactivityThreshold(agent) {
+  const identity = workerIdentity(agent);
   if (identity.includes('qwen')) return 60 * 60;
   if (identity.includes('ornith')) return 10 * 60;
   return 15 * 60;
@@ -1193,7 +1211,7 @@ export function analyzeAgentHealth(lines, options = {}) {
     signals.push(`progress_stall: implementation phase established${guidance}, then ${progress.compactionsSinceMutation} context compactions with no repository mutation and renewed investigation/replanning`);
     concernScore += 2;
   }
-  if (progress.preMutationStall) {
+  if (progress.preMutationStall && isQwenWorker(options.agent)) {
     const minutes = Math.round(progress.currentTurnSeconds / 60);
     signals.push(`pre_mutation_stall: ${progress.currentTurnInvestigations} read/search calls over ${minutes}m of the current turn with no repository mutation`);
     concernScore += 2;
