@@ -14,7 +14,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.5.0' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.0' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
