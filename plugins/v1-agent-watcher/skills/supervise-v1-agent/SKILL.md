@@ -144,12 +144,15 @@ Loop internally:
 - If state is idle/completed, return exactly:
   DONE: worker completed
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
-- If health is suspicious and its signals include `progress_stall`, return exactly:
+- If health is suspicious and its signals include `progress_stall` or `pre_mutation_stall`, return exactly:
   NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation
+- If health is suspicious and its signals include `post_guidance_stall`, return exactly:
+  NEEDS_SOL_REVIEW: worker resumed investigating after parent guidance without mutating the repository
 - If health is otherwise suspicious, unreadable, aborted, or errored, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence copied or summarized only from the observable health signal>
 - Provider and cwd values are diagnostic context, not identity constraints. Persisted cwd can reflect the parent launch context even when the worker correctly changed its shell cwd.
-- A single self-correction is normal. Qwen producing no new persisted output for up to one hour can still be normal model inference and is not suspicious by itself. A single compaction, a long inference, a clean worktree, and one large tool result are each normal on their own; only the deterministic `progress_stall` signal combines them.
+- A single self-correction is normal. Qwen producing no new persisted output for up to one hour can still be normal model inference and is not suspicious by itself. A single compaction, a long inference, a clean worktree, and one large tool result are each normal on their own; only the deterministic stall signals combine them.
+- Keep the normal health-window cadence. `pre_mutation_stall` and `post_guidance_stall` are deterministic enough that the first scheduled inspection catches them; do not shorten the window or add extra polling to find them sooner.
 - If health inspection itself cannot inspect the exact thread, wait another full health window before retrying. Escalate only after three such full-window inspection failures, and describe the inspection failure rather than claiming the worker is unhealthy.
 
 Do not emit periodic progress updates. Continue until one terminal line above can be returned.
@@ -159,7 +162,7 @@ Do not emit periodic progress updates. Continue until one terminal line above ca
 
 `inspect_v1_agent_health` is behavioral screening, not code review. It returns a compact state, `healthy` or `suspicious`, a short signal list, and aggregate recent counts. It intentionally omits the detailed trace.
 
-Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, terminal error/abort states, and `progress_stall`. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
+Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, terminal error/abort states, `progress_stall`, `pre_mutation_stall`, and `post_guidance_stall`. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
 
 Activity age comes from the newest parseable persisted `event_msg` or `response_item` timestamp. Rollout file mtime is only a fallback because Windows can leave mtime stale while a process holds and appends the JSONL. Premise-reversal screening requires explicit backtracking language; ordinary discourse markers such as bare “wait” or “actually” are not reversals.
 
@@ -174,6 +177,28 @@ Activity age comes from the newest parseable persisted `event_msg` or `response_
 
 The health result also reports the supporting facts: `compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, and `progress_stall_after_guidance`.
 
+Compaction is recognized from every persisted spelling, including a top-level `{"type":"compacted"}` record as well as the `event_msg` payload variants.
+
+### pre_mutation_stall
+
+`pre_mutation_stall` catches the different failure mode where the worker diagnoses the task well, keeps planning and testing designs, and never edits the repository. It requires no compaction and no implementation-phase phrase, and it is scoped to the current turn:
+
+1. the current turn has been running for at least 15 minutes;
+2. zero repository mutations in that turn;
+3. at least 10 investigation/read/search calls in that turn.
+
+Any repository mutation in the current turn clears it. Command classification normalizes the persisted command first — the tool prefix, an explicit shell wrapper (`pwsh -Command ...`), and the PowerShell call operator (`& rg ...`) are all stripped — so none of those wrappers hides a read/search call.
+
+### post_guidance_stall
+
+`post_guidance_stall` applies once the parent has already told the worker to implement. It also requires no compaction:
+
+1. parent guidance occurred (a later user message that is not the delegated task and not a compaction bridge summary);
+2. zero repository mutations since that guidance;
+3. at least 3 investigation/read/search calls since that guidance.
+
+Only the newest guidance is in scope, so earlier guidance cannot poison later work.
+
 One compaction, one long inference, a clean worktree before implementation begins, and one huge tool result are each insufficient alone and deliberately do not escalate. Repeated compaction alone is also insufficient now that progress_stall is the discriminating signal: it is reported, and escalates only when an independent signal corroborates it.
 
 `large_tool_output` is reported as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate — the persisted body is truncated, so its stored length understates a pathological result.
@@ -186,10 +211,10 @@ If the parent determines that ordinary technical guidance is needed, send one co
 
 A `progress_stall` escalation never justifies killing a live worker by itself. Recent persisted activity still means the worker is alive; suspicion is a reason for parent review, not automatic abandonment.
 
-On the first `progress_stall` escalation:
+On the first `progress_stall` or `pre_mutation_stall` escalation:
 
 1. Call `inspect_v1_agent` once for a small detailed window.
-2. If that trace confirms the diagnosis is already established, the implementation plan is concrete, and the worker has repeatedly compacted or replanned without mutating the repository, send ONE focused continuation to the SAME worker through `send_input` with `interrupt=false`:
+2. If that trace confirms the diagnosis is already established, the implementation plan is concrete, and the worker has repeatedly compacted, replanned, or simply kept investigating without mutating the repository, send ONE focused continuation to the SAME worker through `send_input` with `interrupt=false`:
 
    ```text
    Stop investigating. Use the diagnosis and implementation plan you already established.
@@ -203,7 +228,7 @@ While reviewing that trace, also check whether the worker expanded past the orig
 
 ### Repeated progress stall after guidance
 
-If the same worker stalls again after that explicit implementation guidance — another compaction/replanning cycle with no mutation, reported as `progress_stall_after_guidance: true` — replacement becomes justified. Close that worker and spawn a replacement whose initial task carries the established diagnosis, the implementation plan, and an explicit instruction to implement before investigating further.
+If the same worker stalls again after that explicit implementation guidance — another compaction/replanning cycle with no mutation, reported as `progress_stall_after_guidance: true`, or renewed investigation with no mutation since the guidance, reported as `post_guidance_stall: true` — replacement becomes justified. Close that worker and spawn a replacement whose initial task carries the established diagnosis, the implementation plan, and an explicit instruction to implement before investigating further.
 
 Do not add progress polling to detect any of this. Progress analysis happens only at the existing logical health-window boundaries or when the worker emits a terminal or suspicious state.
 

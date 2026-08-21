@@ -27,6 +27,13 @@ const COMPACTION_EVENT_TYPES = new Set([
   'compacted',
   'auto_compact_completed',
 ]);
+// A worker that has analysed the repository for this long without touching it
+// is no longer converging on an edit. Both thresholds must be met together.
+const PRE_MUTATION_STALL_SECONDS = 15 * 60;
+const PRE_MUTATION_STALL_INVESTIGATIONS = 10;
+// After explicit parent guidance the bar is much lower: the next few calls are
+// expected to be the fix itself.
+const POST_GUIDANCE_STALL_INVESTIGATIONS = 3;
 
 const recentRolloutCache = new Map();
 
@@ -652,6 +659,16 @@ function repeatedGroup(commands) {
   return nearBest.length >= 3 ? { commands: nearBest, kind: 'near-identical' } : null;
 }
 
+/**
+ * Codex persists compaction either as an `event_msg` payload variant or as a
+ * top-level `{ "type": "compacted" }` record. Both spellings are the same fact.
+ */
+function isCompactionRecord(record) {
+  if (!record || typeof record !== 'object') return false;
+  if (COMPACTION_EVENT_TYPES.has(record.type)) return true;
+  return record.type === 'event_msg' && COMPACTION_EVENT_TYPES.has(record.payload?.type);
+}
+
 function collectHealthFacts(lines) {
   const commands = [];
   const commandsByCallId = new Map();
@@ -684,7 +701,9 @@ function collectHealthFacts(lines) {
     }
 
     const payload = record.payload ?? {};
-    if (record.type === 'response_item') {
+    if (isCompactionRecord(record)) {
+      compactions += 1;
+    } else if (record.type === 'response_item') {
       if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
         addCommand(commandFromCall(payload));
       } else if (payload.type === 'local_shell_call') {
@@ -698,8 +717,7 @@ function collectHealthFacts(lines) {
         markFailure(payload.call_id ?? payload.id ?? null, explicitFailure(payload.output ?? payload.result));
       }
     } else if (record.type === 'event_msg') {
-      if (payload.type === 'context_compacted') compactions += 1;
-      else if (payload.type === 'exec_command_begin') {
+      if (payload.type === 'exec_command_begin') {
         const command = Array.isArray(payload.command) ? payload.command.join(' ') : payload.command;
         addCommand({ callId: payload.call_id ?? null, display: normalizeText(`shell ${command ?? ''}`) });
       } else if (payload.type === 'exec_command_end') {
@@ -714,9 +732,29 @@ function collectHealthFacts(lines) {
   return { commands: commands.slice(-200), compactions, malformedLines };
 }
 
+// Persisted commands arrive as "<tool> <command>", often through an explicit
+// shell invocation, and PowerShell workers routinely call binaries through the
+// call operator ("& rg ..."). All three are wrappers around the command being
+// classified, so they are stripped once here instead of being special-cased
+// inside every classification pattern.
+const COMMAND_TOOL_PREFIX_PATTERN = /^(?:exec_command|shell|local_shell|container\.exec)\s+/i;
+const SHELL_WRAPPER_PATTERN = /^(?:pwsh|powershell(?:\.exe)?|cmd(?:\.exe)?|bash|sh|zsh)(?:\s+[-/][a-z]+)*\s+(?:-command|-c|-lc|\/c)\s+["']?/i;
+const POWERSHELL_CALL_OPERATOR_PATTERN = /^&\s*["']?/;
+const MAX_COMMAND_WRAPPER_PASSES = 4;
+
+function normalizeCommandForClassification(display) {
+  let text = normalizeText(display).replace(COMMAND_TOOL_PREFIX_PATTERN, '');
+  for (let pass = 0; pass < MAX_COMMAND_WRAPPER_PASSES; pass += 1) {
+    const stripped = text.replace(SHELL_WRAPPER_PATTERN, '').replace(POWERSHELL_CALL_OPERATOR_PATTERN, '');
+    if (stripped === text) break;
+    text = stripped;
+  }
+  return text;
+}
+
 // Read-only discovery calls. Used both for the existing investigation-only
 // signal and for post-compaction rediscovery.
-const INVESTIGATION_COMMAND_PATTERN = /^(?:exec_command|shell|local_shell|container\.exec)?\s*(?:rg|grep|egrep|find|fd|ls|dir|tree|gci|get-childitem|get-content|cat|type|head|tail|sed\s+-n|select-string|read_file|list_dir|glob|git\s+(?:diff|status|log|show))\b/i;
+const INVESTIGATION_COMMAND_PATTERN = /^(?:rg|grep|egrep|find|fd|ls|dir|tree|gci|get-childitem|get-content|cat|type|head|tail|sed\s+-n|select-string|read_file|list_dir|glob|git\s+(?:diff|status|log|show))\b/i;
 
 // Persisted evidence that the worker actually changed the repository. This is
 // intentionally broad: a false mutation only suppresses a stall signal, while a
@@ -734,14 +772,18 @@ const IMPLEMENTATION_PHASE_PATTERNS = [
   /\b(?:now|let(?:'s| me)) (?:apply|implement|write) (?:the|these|those) (?:change|changes|fix|fixes|edit|edits|patch)\b/i,
   /\bready to (?:implement|apply) (?:the|this|these) (?:fix|change|changes|patch|plan)\b/i,
   /\btime to (?:implement|apply) (?:the|this|these) (?:fix|change|changes|patch)\b/i,
+  // Short transition announcements observed in the latest Qwen trace, for
+  // example "Now let's implement." and "Writing the service patch."
+  /\bnow\s+let(?:'s|s| us| me)\s+(?:implement|apply|edit|write|patch)\b/i,
+  /\b(?:writing|applying|implementing)\s+(?:the\s+)?(?:[a-z][a-z-]*\s+)?(?:fix|fixes|patch|patches|change|changes|edit|edits)\b/i,
 ];
 
 function isInvestigationCommand(display) {
-  return INVESTIGATION_COMMAND_PATTERN.test(String(display ?? ''));
+  return INVESTIGATION_COMMAND_PATTERN.test(normalizeCommandForClassification(display));
 }
 
 function isMutationCommand(display) {
-  const text = String(display ?? '');
+  const text = normalizeCommandForClassification(display);
   return MUTATION_COMMAND_PATTERNS.some((pattern) => pattern.test(text));
 }
 
@@ -825,6 +867,13 @@ export function emptyProgressFacts() {
     postCompactionRediscovery: false,
     stalled: false,
     stalledAfterGuidance: false,
+    preMutationStall: false,
+    postGuidanceStall: false,
+    currentTurnSeconds: null,
+    currentTurnMutations: 0,
+    currentTurnInvestigations: 0,
+    mutationsSinceGuidance: 0,
+    investigationsSinceGuidance: 0,
     guidanceMessages: 0,
     largeToolOutputs: 0,
     largestToolOutputTokens: 0,
@@ -873,6 +922,15 @@ export function collectProgressFacts(lines, options = {}) {
   let largeToolOutputs = 0;
   let largestToolOutputTokens = 0;
   let largestToolOutputSource = null;
+  // Turn scoping. A rollout that has already been steered through several turns
+  // must not have its unrelated earlier work counted against the current one.
+  let turnIndex = 0;
+  let currentTurnStartMs = null;
+  let currentTurnActive = true;
+
+  const pushEvent = (kind, timestampMs) => {
+    events.push({ kind, timestampMs, turnIndex });
+  };
 
   const addCommand = (callId, display, timestampMs) => {
     if (callId) {
@@ -880,12 +938,12 @@ export function collectProgressFacts(lines, options = {}) {
       seenCallIds.add(callId);
     }
     if (!display) return;
-    if (isMutationCommand(display)) events.push({ kind: 'mutation', timestampMs });
-    else if (isInvestigationCommand(display)) events.push({ kind: 'investigation', timestampMs });
+    if (isMutationCommand(display)) pushEvent('mutation', timestampMs);
+    else if (isInvestigationCommand(display)) pushEvent('investigation', timestampMs);
   };
 
   const addText = (text, timestampMs) => {
-    if (isImplementationPhaseText(text)) events.push({ kind: 'implementation_phase', timestampMs });
+    if (isImplementationPhaseText(text)) pushEvent('implementation_phase', timestampMs);
   };
 
   const addUserMessage = (text, timestampMs) => {
@@ -898,7 +956,7 @@ export function collectProgressFacts(lines, options = {}) {
     // parent guidance.
     if (userMessages === 1) return;
     if (recordsSinceCompaction <= COMPACTION_BRIDGE_RECORDS) return;
-    events.push({ kind: 'guidance', timestampMs });
+    pushEvent('guidance', timestampMs);
   };
 
   const addOutput = (payload) => {
@@ -925,10 +983,19 @@ export function collectProgressFacts(lines, options = {}) {
     const timestampMs = Number.isFinite(parsedTimestamp) ? parsedTimestamp : null;
     recordsSinceCompaction += 1;
 
+    if (isCompactionRecord(record)) {
+      pushEvent('compaction', timestampMs);
+      recordsSinceCompaction = 0;
+      continue;
+    }
+
     if (record.type === 'event_msg') {
-      if (COMPACTION_EVENT_TYPES.has(payload.type)) {
-        events.push({ kind: 'compaction', timestampMs });
-        recordsSinceCompaction = 0;
+      if (payload.type === 'task_started' || payload.type === 'turn_started') {
+        turnIndex += 1;
+        currentTurnStartMs = timestampMs;
+        currentTurnActive = true;
+      } else if (payload.type === 'task_complete' || payload.type === 'turn_complete' || payload.type === 'turn_aborted') {
+        currentTurnActive = false;
       } else if (payload.type === 'exec_command_begin') {
         const command = Array.isArray(payload.command) ? payload.command.join(' ') : payload.command;
         addCommand(payload.call_id ?? null, normalizeText(`shell ${command ?? ''}`), timestampMs);
@@ -977,6 +1044,32 @@ export function collectProgressFacts(lines, options = {}) {
   const lastMutationMs = lastMutationIndex >= 0 ? events[lastMutationIndex].timestampMs : null;
   const nowMs = options.nowMs ?? Date.now();
 
+  // Pre-mutation stall: long, productive-looking analysis inside the current
+  // turn that never became an edit. Deliberately independent of compaction.
+  const currentTurnEvents = events.filter((event) => event.turnIndex === turnIndex);
+  const currentTurnMutations = currentTurnEvents.filter((event) => event.kind === 'mutation').length;
+  const currentTurnInvestigations = currentTurnEvents.filter((event) => event.kind === 'investigation').length;
+  const turnStartMs = currentTurnStartMs
+    ?? currentTurnEvents.find((event) => event.timestampMs !== null && event.timestampMs !== undefined)?.timestampMs
+    ?? null;
+  const currentTurnSeconds = turnStartMs === null || turnStartMs === undefined
+    ? null
+    : Math.max(0, Math.round((nowMs - turnStartMs) / 1000));
+  const preMutationStall = currentTurnActive
+    && currentTurnMutations === 0
+    && currentTurnSeconds !== null
+    && currentTurnSeconds >= PRE_MUTATION_STALL_SECONDS
+    && currentTurnInvestigations >= PRE_MUTATION_STALL_INVESTIGATIONS;
+
+  // Post-guidance stall: the parent already told this worker to implement, and
+  // only the newest guidance is in scope, so earlier guidance cannot poison it.
+  const eventsSinceGuidance = lastGuidanceIndex >= 0 ? events.slice(lastGuidanceIndex + 1) : [];
+  const mutationsSinceGuidance = eventsSinceGuidance.filter((event) => event.kind === 'mutation').length;
+  const investigationsSinceGuidance = eventsSinceGuidance.filter((event) => event.kind === 'investigation').length;
+  const postGuidanceStall = lastGuidanceIndex >= 0
+    && mutationsSinceGuidance === 0
+    && investigationsSinceGuidance >= POST_GUIDANCE_STALL_INVESTIGATIONS;
+
   return {
     compactions: events.filter((event) => event.kind === 'compaction').length,
     mutations: events.filter((event) => event.kind === 'mutation').length,
@@ -987,6 +1080,13 @@ export function collectProgressFacts(lines, options = {}) {
     postCompactionRediscovery: sinceMutation.postCompactionRediscovery,
     stalled: sinceMutation.stalled,
     stalledAfterGuidance: Boolean(sinceGuidance?.stalled),
+    preMutationStall,
+    postGuidanceStall,
+    currentTurnSeconds,
+    currentTurnMutations,
+    currentTurnInvestigations,
+    mutationsSinceGuidance,
+    investigationsSinceGuidance,
     guidanceMessages: events.filter((event) => event.kind === 'guidance').length,
     largeToolOutputs,
     largestToolOutputTokens,
@@ -1092,6 +1192,15 @@ export function analyzeAgentHealth(lines, options = {}) {
     const guidance = progress.stalledAfterGuidance ? ' after earlier parent guidance' : '';
     signals.push(`progress_stall: implementation phase established${guidance}, then ${progress.compactionsSinceMutation} context compactions with no repository mutation and renewed investigation/replanning`);
     concernScore += 2;
+  }
+  if (progress.preMutationStall) {
+    const minutes = Math.round(progress.currentTurnSeconds / 60);
+    signals.push(`pre_mutation_stall: ${progress.currentTurnInvestigations} read/search calls over ${minutes}m of the current turn with no repository mutation`);
+    concernScore += 2;
+  }
+  if (progress.postGuidanceStall) {
+    signals.push(`post_guidance_stall: ${progress.investigationsSinceGuidance} read/search calls since parent guidance with no repository mutation`);
+    concernScore += 3;
   }
   if (progress.largeToolOutputs) {
     signals.push(`large_tool_output: ${progress.largeToolOutputs} tool results above ~${LARGE_TOOL_OUTPUT_TOKENS} tokens (largest ~${progress.largestToolOutputTokens}, ${progress.largestToolOutputSource})`);
@@ -1383,6 +1492,13 @@ export function formatHealthInspection(result) {
     progress: {
       progress_stall: progress.stalled,
       progress_stall_after_guidance: progress.stalledAfterGuidance,
+      pre_mutation_stall: progress.preMutationStall,
+      post_guidance_stall: progress.postGuidanceStall,
+      current_turn_seconds: progress.currentTurnSeconds,
+      current_turn_mutations: progress.currentTurnMutations,
+      current_turn_investigations: progress.currentTurnInvestigations,
+      mutations_since_guidance: progress.mutationsSinceGuidance,
+      investigations_since_guidance: progress.investigationsSinceGuidance,
       compactions: progress.compactions,
       compactions_since_mutation: progress.compactionsSinceMutation,
       mutation_events: progress.mutations,

@@ -28,7 +28,23 @@ A worker can stay technically active — still reasoning, still calling tools �
 3. no persisted repository-mutation call since — any patch/write/mutating-shell call resets the evidence;
 4. renewed rediscovery or replanning after the newest compaction instead of implementation.
 
-The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes.
+The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes. Compaction is read from every persisted spelling, including a top-level `{"type":"compacted"}` record as well as the `event_msg` payload variants.
+
+Two further stall signals catch the pattern that survives a tool-output token cap: a worker that diagnoses the task correctly, keeps planning and testing designs, and never edits the repository. Neither requires a compaction or an implementation-phase phrase.
+
+`pre_mutation_stall` is scoped to the current turn and requires all of:
+
+1. the current turn has been running for at least 15 minutes;
+2. zero repository mutations in that turn;
+3. at least 10 investigation/read/search calls in that turn.
+
+`post_guidance_stall` applies once the parent has already told the worker to implement, where action is expected quickly, and requires all of:
+
+1. parent guidance occurred (a later user message that is neither the delegated task nor a compaction bridge summary);
+2. zero repository mutations since that guidance;
+3. at least 3 investigation/read/search calls since that guidance.
+
+Any repository mutation clears the corresponding stall, and only the newest guidance is in scope so earlier guidance cannot poison later work. Persisted commands are normalized before classification — the tool prefix, an explicit shell wrapper (`pwsh -Command ...`), and the PowerShell call operator (`& rg ...`) are all stripped — so none of those wrappers hides a read/search call. Both signals report their supporting facts (`current_turn_seconds`, `current_turn_mutations`, `current_turn_investigations`, `mutations_since_guidance`, `investigations_since_guidance`). Neither shortens the supervision cadence: they are deterministic enough for the first scheduled health-window inspection to catch them.
 
 Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. Repeated compaction on its own no longer escalates either — a worker that edits between compactions is productive — so it is reported as a fact and escalates only alongside an independent signal.
 
@@ -52,7 +68,7 @@ Sol waits on Luna through the native one-hour `wait_agent`, with the enclosing C
 
 After escalation, inactivity alone is not grounds to abandon a worker. If detailed inspection still shows `running` with recent persisted activity, Sol keeps that worker unless there is an independent terminal, unreadable, error, or clear loop signal.
 
-A `progress_stall` escalation follows the same principle. On the first stall Sol inspects the detailed trace and, if it confirms an established diagnosis and concrete plan, sends one focused continuation to the same worker telling it to implement the smallest supported fix now rather than investigating further; the worker is not replaced. Sol also checks there whether the worker broadened past the original task after already finding a sufficient fix, and may tell it to defer adjacent architectural concerns. If the same worker stalls again after that explicit guidance — reported as `progress_stall_after_guidance` — replacement becomes justified. None of this adds polling: progress analysis happens only at the existing health-window boundaries.
+A `progress_stall` escalation follows the same principle. On the first stall Sol inspects the detailed trace and, if it confirms an established diagnosis and concrete plan, sends one focused continuation to the same worker telling it to implement the smallest supported fix now rather than investigating further; the worker is not replaced. Sol also checks there whether the worker broadened past the original task after already finding a sufficient fix, and may tell it to defer adjacent architectural concerns. If the same worker stalls again after that explicit guidance — reported as `progress_stall_after_guidance`, or as `post_guidance_stall` when it simply resumed investigating without mutating anything — replacement becomes justified. None of this adds polling: progress analysis happens only at the existing health-window boundaries.
 
 ### Local-worker reasoning levels
 

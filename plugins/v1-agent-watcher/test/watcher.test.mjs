@@ -817,3 +817,327 @@ test('two compactions with an intervening mutation remain healthy', () => {
   assert.equal(health.progress.compactionsSinceMutation, 1);
   assert.equal(health.progress.secondsSinceMutation, 1260);
 });
+
+function investigationBurst(count, prefix, startIso, command = ['rg']) {
+  const startMs = Date.parse(startIso);
+  return Array.from({ length: count }, (unused, index) => shellLine(
+    `${prefix}${index}`,
+    [...command, `Symbol${index}`, 'src'],
+    new Date(startMs + index * 60_000).toISOString(),
+  ));
+}
+
+test('a top-level compacted record counts as a compaction in both collection paths', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    reasoningLine('My implementation plan is to drop stale responses.', '2026-08-20T09:00:30Z'),
+    JSON.stringify({ timestamp: '2026-08-20T09:20:00Z', type: 'compacted' }),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:21:00Z'),
+    reasoningLine("Now let's implement.", '2026-08-20T09:30:00Z'),
+    JSON.stringify({ timestamp: '2026-08-20T09:40:00Z', type: 'compacted', payload: { summary: 'bridge' } }),
+    shellLine('c2', ['rg', 'MockRepository', 'src'], '2026-08-20T09:41:00Z'),
+    shellLine('c3', ['rg', 'MockRepository', 'tests'], '2026-08-20T09:42:00Z'),
+    shellLine('c4', ['get-childitem', 'tests'], '2026-08-20T09:43:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:44:00Z'),
+  });
+
+  assert.equal(health.recentSummary.contextCompactions, 2);
+  assert.equal(health.progress.compactions, 2);
+  assert.equal(health.progress.compactionsSinceMutation, 2);
+  assert.equal(health.progress.stalled, true);
+  assert.ok(health.signals.some((signal) => signal.startsWith('progress_stall:')));
+});
+
+test('every persisted compaction spelling is still recognized', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'context_compacted' }, '2026-08-20T09:00:00Z'),
+    event('event_msg', { type: 'conversation_compacted' }, '2026-08-20T09:05:00Z'),
+    event('event_msg', { type: 'auto_compact_completed' }, '2026-08-20T09:10:00Z'),
+    JSON.stringify({ timestamp: '2026-08-20T09:15:00Z', type: 'compacted' }),
+  ]);
+
+  assert.equal(facts.compactions, 4);
+});
+
+test('a top-level compacted record still suppresses the compaction bridge summary', () => {
+  const facts = collectProgressFacts([
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:00Z'),
+    JSON.stringify({ timestamp: '2026-08-20T09:20:00Z', type: 'compacted' }),
+    userLine('Summary of the previous session: the callback drops nothing yet.', '2026-08-20T09:20:01Z'),
+  ]);
+
+  assert.equal(facts.compactions, 1);
+  assert.equal(facts.guidanceMessages, 0);
+});
+
+test('a PowerShell call-operator read command is classified as investigation', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    shellLine('c1', ['&', 'rg', 'LeaderboardService', 'src'], '2026-08-20T09:01:00Z'),
+    shellLine('c2', ['&', 'git', 'status'], '2026-08-20T09:02:00Z'),
+    shellLine('c3', ['& get-childitem tests'], '2026-08-20T09:03:00Z'),
+    shellLine('c4', ['&', 'dotnet', 'build'], '2026-08-20T09:04:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:05:00Z') });
+
+  // The three read/search calls count; `& dotnet build` is not investigation.
+  assert.equal(facts.currentTurnInvestigations, 3);
+  assert.equal(facts.currentTurnMutations, 0);
+});
+
+test('a PowerShell call-operator mutation is still recognized as a mutation', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    shellLine('c1', ['&', 'git', 'apply', 'fix.patch'], '2026-08-20T09:01:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:02:00Z') });
+
+  assert.equal(facts.mutations, 1);
+  assert.equal(facts.currentTurnMutations, 1);
+});
+
+test('a long current turn of read/search calls with no mutation is a pre-mutation stall', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    reasoningLine('The stale row comes from the leaderboard callback.', '2026-08-20T09:01:00Z'),
+    ...investigationBurst(10, 'p', '2026-08-20T09:02:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:20:00Z'),
+  });
+
+  assert.equal(health.state, 'running');
+  assert.equal(health.health, 'suspicious');
+  assert.ok(health.signals.some((signal) => signal.startsWith('pre_mutation_stall:')));
+  assert.equal(health.progress.preMutationStall, true);
+  assert.equal(health.progress.currentTurnInvestigations, 10);
+  assert.equal(health.progress.currentTurnMutations, 0);
+  assert.equal(health.progress.currentTurnSeconds, 1200);
+  // The pre-mutation path is deliberately independent of compaction.
+  assert.equal(health.progress.compactions, 0);
+  assert.equal(health.progress.stalled, false);
+});
+
+test('the pre-mutation stall also fires on PowerShell call-operator searches', () => {
+  const health = analyzeAgentHealth([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(10, 'q', '2026-08-20T09:01:00Z', ['&', 'rg']),
+  ], {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:20:00Z'),
+  });
+
+  assert.equal(health.progress.currentTurnInvestigations, 10);
+  assert.equal(health.progress.preMutationStall, true);
+  assert.equal(health.health, 'suspicious');
+});
+
+test('a current turn below the pre-mutation time threshold stays healthy', () => {
+  const health = analyzeAgentHealth([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(10, 'p', '2026-08-20T09:00:30Z'),
+  ], {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:12:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.preMutationStall, false);
+  assert.equal(health.progress.currentTurnSeconds, 720);
+});
+
+test('a long current turn below the pre-mutation investigation threshold stays healthy', () => {
+  const health = analyzeAgentHealth([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(9, 'p', '2026-08-20T09:02:00Z'),
+  ], {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:40:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.preMutationStall, false);
+  assert.equal(health.progress.currentTurnInvestigations, 9);
+});
+
+test('a repository mutation in the current turn clears the pre-mutation stall', () => {
+  const health = analyzeAgentHealth([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(10, 'p', '2026-08-20T09:02:00Z'),
+    patchLine('m1', '2026-08-20T09:15:00Z'),
+  ], {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:20:00Z'),
+  });
+
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.preMutationStall, false);
+  assert.equal(health.progress.currentTurnMutations, 1);
+});
+
+test('pre-mutation stall accounting is scoped to the current turn, not the whole rollout', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T08:00:00Z'),
+    ...investigationBurst(10, 'old', '2026-08-20T08:01:00Z'),
+    event('event_msg', { type: 'task_complete' }, '2026-08-20T08:30:00Z'),
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(2, 'new', '2026-08-20T09:01:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:40:00Z') });
+
+  assert.equal(facts.preMutationStall, false);
+  assert.equal(facts.currentTurnInvestigations, 2);
+  assert.equal(facts.currentTurnSeconds, 2400);
+});
+
+test('a completed turn is not reported as a pre-mutation stall', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    ...investigationBurst(10, 'p', '2026-08-20T09:02:00Z'),
+    event('event_msg', { type: 'task_complete' }, '2026-08-20T09:20:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:40:00Z') });
+
+  assert.equal(facts.preMutationStall, false);
+  assert.equal(facts.currentTurnInvestigations, 10);
+});
+
+test('renewed investigation after parent guidance is a post-guidance stall without any compaction', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    patchLine('m1', '2026-08-20T09:05:00Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:10:00Z'),
+    shellLine('g1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:11:00Z'),
+    shellLine('g2', ['rg', 'incSeason', 'src'], '2026-08-20T09:12:00Z'),
+    shellLine('g3', ['get-childitem', 'tests'], '2026-08-20T09:13:00Z'),
+  ];
+
+  const facts = collectProgressFacts(lines, { nowMs: Date.parse('2026-08-20T09:14:00Z') });
+  assert.equal(facts.compactions, 0);
+  assert.equal(facts.guidanceMessages, 1);
+  assert.equal(facts.postGuidanceStall, true);
+  assert.equal(facts.investigationsSinceGuidance, 3);
+  assert.equal(facts.mutationsSinceGuidance, 0);
+  // Distinguishable from the compaction-based stall and from the pre-mutation path.
+  assert.equal(facts.stalled, false);
+  assert.equal(facts.stalledAfterGuidance, false);
+  assert.equal(facts.preMutationStall, false);
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:14:00Z'),
+  });
+  assert.equal(health.health, 'suspicious');
+  assert.ok(health.signals.some((signal) => signal.startsWith('post_guidance_stall:')));
+  assert.equal(health.signals.some((signal) => signal.startsWith('progress_stall:')), false);
+});
+
+test('too few read/search calls after guidance is not a post-guidance stall', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:10:00Z'),
+    shellLine('g1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:11:00Z'),
+    shellLine('g2', ['rg', 'incSeason', 'src'], '2026-08-20T09:12:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:13:00Z') });
+
+  assert.equal(facts.postGuidanceStall, false);
+  assert.equal(facts.investigationsSinceGuidance, 2);
+});
+
+test('a mutation after guidance clears the post-guidance stall', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:10:00Z'),
+    shellLine('g1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:11:00Z'),
+    shellLine('g2', ['rg', 'incSeason', 'src'], '2026-08-20T09:12:00Z'),
+    shellLine('g3', ['get-childitem', 'tests'], '2026-08-20T09:13:00Z'),
+    patchLine('m2', '2026-08-20T09:14:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:15:00Z') });
+
+  assert.equal(facts.postGuidanceStall, false);
+  assert.equal(facts.mutationsSinceGuidance, 1);
+  // The read/search calls are still counted from the guidance; the mutation is
+  // what clears the stall.
+  assert.equal(facts.investigationsSinceGuidance, 3);
+});
+
+test('only the newest guidance scopes the post-guidance stall', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:10:00Z'),
+    shellLine('g1', ['rg', 'LeaderboardService', 'src'], '2026-08-20T09:11:00Z'),
+    shellLine('g2', ['rg', 'incSeason', 'src'], '2026-08-20T09:12:00Z'),
+    shellLine('g3', ['get-childitem', 'tests'], '2026-08-20T09:13:00Z'),
+    userLine('Good. Now also cover the season rollover case.', '2026-08-20T09:20:00Z'),
+    patchLine('m1', '2026-08-20T09:21:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:22:00Z') });
+
+  assert.equal(facts.guidanceMessages, 2);
+  assert.equal(facts.postGuidanceStall, false);
+  assert.equal(facts.investigationsSinceGuidance, 0);
+  assert.equal(facts.mutationsSinceGuidance, 1);
+});
+
+test('short implementation transition announcements commit an implementation phase', () => {
+  const committed = [
+    "Now let's implement.",
+    'Now let me apply the fix now.',
+    'Writing the service patch.',
+    'Applying the fix.',
+    'Implementing the changes.',
+    'Writing the fix.',
+  ];
+  for (const text of committed) {
+    const facts = collectProgressFacts([reasoningLine(text, '2026-08-20T09:00:00Z')]);
+    assert.equal(facts.implementationPhaseCommitted, true, text);
+  }
+
+  const ordinary = [
+    'The implementation is more complex than it looks.',
+    'We should discuss implementation details before deciding.',
+    'Implementation of the parser lives in src/parse.ts.',
+    'Reading the patch file to understand the change.',
+  ];
+  for (const text of ordinary) {
+    const facts = collectProgressFacts([reasoningLine(text, '2026-08-20T09:00:00Z')]);
+    assert.equal(facts.implementationPhaseCommitted, false, text);
+  }
+});
+
+test('an explicit shell wrapper around a read command does not hide the investigation', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    shellLine('c1', ['pwsh', '-NoProfile', '-Command', '& rg LeaderboardService src'], '2026-08-20T09:01:00Z'),
+    shellLine('c2', ['powershell.exe', '-Command', 'get-childitem tests'], '2026-08-20T09:02:00Z'),
+    shellLine('c3', ['bash', '-lc', 'rg incSeason src'], '2026-08-20T09:03:00Z'),
+    shellLine('c4', ['pwsh', '-Command', 'dotnet build'], '2026-08-20T09:04:00Z'),
+    shellLine('c5', ['pwsh', '-Command', '& git apply fix.patch'], '2026-08-20T09:05:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:06:00Z') });
+
+  assert.equal(facts.currentTurnInvestigations, 3);
+  assert.equal(facts.currentTurnMutations, 1);
+});
+
+test('an apply_patch tool call is still the canonical mutation evidence', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    patchLine('m1', '2026-08-20T09:01:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:02:00Z') });
+
+  assert.equal(facts.mutations, 1);
+  assert.equal(facts.currentTurnMutations, 1);
+  assert.equal(facts.currentTurnInvestigations, 0);
+});

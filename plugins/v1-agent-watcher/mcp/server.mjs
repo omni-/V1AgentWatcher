@@ -16,7 +16,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.3' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.4' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -69,7 +69,7 @@ const TOOLS = [
   },
   {
     name: 'inspect_v1_agent_health',
-    description: 'Run a small deterministic behavioral health screen for one V1 collaboration child. Detects observable looping, repeated failures/backtracking, repeated compaction, conservative inactivity, and progress stalls where an implementation phase was committed but repeated compaction/replanning followed with no repository mutation. It does not judge engineering correctness or return the detailed trace.',
+    description: 'Run a small deterministic behavioral health screen for one V1 collaboration child. Detects observable looping, repeated failures/backtracking, repeated compaction, conservative inactivity, and progress stalls: a committed implementation phase followed by repeated compaction/replanning with no repository mutation, a long current turn of read/search calls that never mutated the repository, and renewed investigation after explicit parent guidance. It does not judge engineering correctness or return the detailed trace.',
     inputSchema: {
       type: 'object',
       properties: {
