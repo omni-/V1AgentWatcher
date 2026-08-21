@@ -4,6 +4,7 @@ import {
   accumulateHealthWindow,
   formatAgentList,
   formatHealthInspection,
+  formatHealthWindow,
   formatInspection,
   inspectAgentHealth,
   inspectAgentSession,
@@ -16,7 +17,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.4' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.5' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -49,18 +50,18 @@ const TOOLS = [
         health_window_ms: {
           type: 'integer',
           minimum: 1,
-          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself.',
+          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself. Read the accumulator inputs for the next call back from that returned health_window object.',
         },
         elapsed_health_window_ms: {
           type: 'integer',
           minimum: 0,
           default: 0,
-          description: 'Successful timeout-chunk time already accumulated in the current logical window. Reset to 0 after each health inspection.',
+          description: 'Successful timeout-chunk time already accumulated in the current logical window. Carry it forward from the returned health_window.elapsed_ms (aliased as health_window.elapsed_health_window_ms). Reset to 0 after each health inspection.',
         },
         found_in_health_window: {
           type: 'boolean',
           default: false,
-          description: 'Whether an earlier completed chunk in the current logical window already observed the worker.',
+          description: 'Whether an earlier completed chunk in the current logical window already observed the worker. Carry it forward from the returned health_window.found_in_window (aliased as health_window.found_in_health_window).',
         },
       },
       required: ['thread_id'],
@@ -201,18 +202,7 @@ async function callTool(name, args = {}) {
         waitedMs: result.waitedMs,
         found: result.found,
       });
-      return resultJson({
-        ...result,
-        health_window: {
-          window_ms: window.windowMs,
-          elapsed_ms: window.elapsedMs,
-          remaining_ms: window.remainingMs,
-          next_chunk_ms: window.nextChunkMs,
-          found_in_window: window.foundInWindow,
-          inspect_now: window.inspectNow,
-          missing_window: window.missingWindow,
-        },
-      });
+      return resultJson({ ...result, health_window: formatHealthWindow(window) });
     }
     case 'inspect_v1_agent_health': {
       if (!args.thread_id && !args.nickname) {

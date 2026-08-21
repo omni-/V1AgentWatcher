@@ -1396,6 +1396,29 @@ export function accumulateHealthWindow(options = {}) {
   };
 }
 
+/**
+ * Shape accumulator state for the `wait_v1_agent` result.
+ *
+ * `elapsed_ms` and `found_in_window` are the canonical fields. The
+ * `elapsed_health_window_ms` and `found_in_health_window` aliases repeat those
+ * exact values under the tool's input-argument names, so a watchdog that reads
+ * back the names it sent still carries real accumulator state into the next
+ * chunk instead of silently restarting the logical window every time.
+ */
+export function formatHealthWindow(window) {
+  return {
+    window_ms: window.windowMs,
+    elapsed_ms: window.elapsedMs,
+    remaining_ms: window.remainingMs,
+    next_chunk_ms: window.nextChunkMs,
+    found_in_window: window.foundInWindow,
+    inspect_now: window.inspectNow,
+    missing_window: window.missingWindow,
+    elapsed_health_window_ms: window.elapsedMs,
+    found_in_health_window: window.foundInWindow,
+  };
+}
+
 export async function waitForAgent(options = {}) {
   if (!options.threadId) throw new Error('threadId is required');
 
