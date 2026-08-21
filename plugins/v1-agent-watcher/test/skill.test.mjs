@@ -64,3 +64,49 @@ test('local-worker reasoning documents inheritance rather than claiming omission
   const spawnContract = skill.slice(0, skill.indexOf('## Local-worker reasoning configuration'));
   assert.equal(/reasoning[_ ]effort\s*[:=]\s*"?(low|medium|high|xhigh)"?/i.test(spawnContract), false);
 });
+
+test('the contract documents the compaction-independent stall signals and their thresholds', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /### pre_mutation_stall/);
+  assert.match(skill, /the current turn has been running for at least 15 minutes/);
+  assert.match(skill, /at least 10 investigation\/read\/search calls in that turn/);
+  assert.match(skill, /### post_guidance_stall/);
+  assert.match(skill, /at least 3 investigation\/read\/search calls since that guidance/);
+  assert.match(skill, /It requires no compaction and no implementation-phase phrase/);
+  assert.match(skill, /Only the newest guidance is in scope/);
+  assert.match(skill, /a top-level `\{"type":"compacted"\}` record/);
+  assert.match(skill, /`& rg \.\.\.`/);
+  // The two new signals must be separately actionable for the watchdog.
+  assert.match(skill, /signals include `progress_stall` or `pre_mutation_stall`/);
+  assert.match(skill, /NEEDS_SOL_REVIEW: worker resumed investigating after parent guidance without mutating the repository/);
+  assert.match(skill, /`post_guidance_stall: true`[\s\S]*replacement becomes justified/);
+});
+
+test('the supervision cadence is unchanged by the new stall signals', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker/);
+  assert.match(skill, /do not shorten the window or add extra polling to find them sooner/);
+  assert.match(skill, /Do not add progress polling/);
+});
+
+test('the contract scopes the pre-mutation stall to Qwen and excludes framework preambles from guidance', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /only a Qwen worker escalates on it/);
+  assert.match(skill, /For Ornith and unknown local workers the fact is still reported/);
+  assert.match(skill, /not a framework `<environment_context>` preamble/);
+});
+
+test('the watchdog checks post_guidance_stall before the first-stall signals', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  const postGuidance = skill.indexOf('signals include `post_guidance_stall`');
+  const firstStall = skill.indexOf('signals include `progress_stall` or `pre_mutation_stall`');
+  assert.ok(postGuidance > 0 && firstStall > 0);
+  // A worker stalling after guidance raises the first-stall signals too, so the
+  // weaker line must not be able to match first and hide the repeated stall.
+  assert.ok(postGuidance < firstStall, 'post_guidance_stall must be checked first');
+  assert.match(skill, /Check the stall signals in this order and return on the first match/);
+});
