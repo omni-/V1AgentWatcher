@@ -170,9 +170,11 @@ Loop internally:
 - If state is idle/completed, return exactly:
   DONE: worker completed
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
-- Check the stall signals in this order and return on the first match. A worker that stalls after guidance usually raises the earlier signals too, so checking `post_guidance_stall` first is what keeps the repeated-stall case distinguishable from the first stall.
+- Check the stall signals in this order and return on the first match: `post_guidance_stall`, then `post_mutation_stall`, then `progress_stall`/`pre_mutation_stall`, then any other suspicious state. A worker that stalls after guidance usually raises the earlier signals too, so checking `post_guidance_stall` first is what keeps the repeated-stall case distinguishable from the first stall, and `post_mutation_stall` must be recognized before the first-stall branch because a worker that already mutated is in a different state from one that never did.
 - If health is suspicious and its signals include `post_guidance_stall`, return exactly:
   NEEDS_SOL_REVIEW: worker resumed investigating after parent guidance without mutating the repository
+- Otherwise, if health is suspicious and its signals include `post_mutation_stall`, return exactly:
+  NEEDS_SOL_REVIEW: worker changed the repository but has spent too long investigating without further mutation
 - Otherwise, if health is suspicious and its signals include `progress_stall` or `pre_mutation_stall`, return exactly:
   NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation
 - If health is otherwise suspicious, unreadable, aborted, or errored, return exactly:
@@ -189,7 +191,7 @@ Do not emit periodic progress updates. Continue until one terminal line above ca
 
 `inspect_v1_agent_health` is behavioral screening, not code review. It returns a compact state, `healthy` or `suspicious`, a short signal list, and aggregate recent counts. It intentionally omits the detailed trace.
 
-Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, terminal error/abort states, `progress_stall`, `pre_mutation_stall`, and `post_guidance_stall`. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
+Potential suspicious signals include repeated premise reversals, repeated identical or near-identical calls, repeated failures without a changed command, repeated context compaction, conservative long inactivity, terminal error/abort states, `progress_stall`, `pre_mutation_stall`, `post_guidance_stall`, and `post_mutation_stall`. One self-correction, meaningfully different searches, or ordinary Qwen latency should remain healthy.
 
 Activity age comes from the newest parseable persisted `event_msg` or `response_item` timestamp. Rollout file mtime is only a fallback because Windows can leave mtime stale while a process holds and appends the JSONL. Premise-reversal screening requires explicit backtracking language; ordinary discourse markers such as bare “wait” or “actually” are not reversals.
 
@@ -228,6 +230,20 @@ Any repository mutation in the current turn clears it. Command classification no
 
 Only the newest guidance is in scope, so earlier guidance cannot poison later work.
 
+### post_mutation_stall
+
+`post_mutation_stall` covers the state after implementation has already started: the worker changed the repository, then kept investigating — validation approaches, adjacent designs, test infrastructure — without editing again. It requires no compaction, no implementation-phase phrase, no parent guidance, no failed command, and no repeated command:
+
+1. the current turn is still active;
+2. at least one repository mutation occurred in the current turn;
+3. at least 30 minutes have elapsed since the newest mutation;
+4. at least 10 investigation/read/search calls occurred after that newest mutation;
+5. no later repository mutation occurred.
+
+The newest mutation is the reset point, so a later edit restarts both the elapsed window and the investigation count. Build and test commands are not investigation calls, so validating an implementation does not accumulate toward the threshold.
+
+Its thresholds are calibrated on Qwen benchmark traces, so like `pre_mutation_stall` only a Qwen worker escalates on it; for Ornith and unknown local workers the fact is reported and the result stays healthy on that signal alone. The supporting facts are `post_mutation_stall` and `investigations_since_latest_mutation`, alongside the existing `seconds_since_mutation`, which already measures elapsed time from the newest mutation.
+
 One compaction, one long inference, a clean worktree before implementation begins, and one huge tool result are each insufficient alone and deliberately do not escalate. Repeated compaction alone is also insufficient now that progress_stall is the discriminating signal: it is reported, and escalates only when an independent signal corroborates it.
 
 `large_tool_output` is reported as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate — the persisted body is truncated, so its stored length understates a pathological result.
@@ -254,6 +270,26 @@ On the first `progress_stall` or `pre_mutation_stall` escalation:
 3. Resume the same worker and the same Luna supervision loop. Do not replace the worker and do not spawn a second worker.
 
 While reviewing that trace, also check whether the worker expanded past the originally requested task after it had already identified a sufficient fix. If it did, the continuation may add one sentence telling it to implement the smallest fix supported by the original task and to defer adjacent architectural concerns unless correctness requires them. This is a scope instruction from the parent, not a code review by the watchdog; Luna never judges which fix is correct.
+
+### First post-mutation stall: continue the same worker
+
+A `post_mutation_stall` is not the repeated-stall case, even when the parent has already sent guidance earlier in the run. Earlier guidance may be exactly why the mutation exists: the worker was told to implement, and it did. A later post-mutation stall therefore does not mean the worker ignored parent guidance, and it does not enter the replacement path.
+
+On the first `post_mutation_stall`:
+
+1. Call `inspect_v1_agent` once for a small detailed window.
+2. If that trace confirms the implementation has already been made and the worker is stuck in validation or adjacent investigation, send ONE concise continuation to the SAME worker through `send_input` with `interrupt=false`:
+
+   ```text
+   Preserve the implementation you already made.
+   Stop expanding into adjacent approaches or validation infrastructure.
+   Run the narrowest existing build/tests that apply, then finish and report.
+   Do not refactor production code or add new infrastructure solely to make validation easier unless the original task requires it.
+   ```
+
+3. Resume the same worker and the same Luna supervision loop. Do not replace the worker and do not spawn a second worker.
+
+If the worker then trips `post_guidance_stall` against THIS newest continuation — at least three read/search calls and zero mutations since it — the existing replacement policy applies normally. In other words, first guidance -> mutation -> `post_mutation_stall` does not justify replacement, while `post_mutation_stall` -> focused continuation -> `post_guidance_stall` may.
 
 ### Repeated progress stall after guidance
 

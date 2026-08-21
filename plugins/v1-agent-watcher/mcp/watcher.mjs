@@ -39,6 +39,11 @@ const PRE_MUTATION_STALL_INVESTIGATIONS = 10;
 // After explicit parent guidance the bar is much lower: the next few calls are
 // expected to be the fix itself.
 const POST_GUIDANCE_STALL_INVESTIGATIONS = 3;
+// Post-mutation thresholds are calibrated on the same Qwen benchmark traces:
+// a worker that did edit the repository and then spent over half an hour
+// investigating validation approaches without editing again.
+const POST_MUTATION_STALL_SECONDS = 30 * 60;
+const POST_MUTATION_STALL_INVESTIGATIONS = 10;
 
 const recentRolloutCache = new Map();
 
@@ -874,6 +879,8 @@ export function emptyProgressFacts() {
     stalledAfterGuidance: false,
     preMutationStall: false,
     postGuidanceStall: false,
+    postMutationStall: false,
+    investigationsSinceLatestMutation: 0,
     currentTurnSeconds: null,
     currentTurnMutations: 0,
     currentTurnInvestigations: 0,
@@ -1076,11 +1083,28 @@ export function collectProgressFacts(lines, options = {}) {
     && mutationsSinceGuidance === 0
     && investigationsSinceGuidance >= POST_GUIDANCE_STALL_INVESTIGATIONS;
 
+  // Post-mutation stall: the worker did change the repository in this turn and
+  // then kept investigating instead of finishing. The newest mutation is the
+  // reset point, so a later edit restarts both the elapsed window and the count.
+  // No compaction, implementation-phase phrase, parent guidance, failed command,
+  // or repeated command is required.
+  const secondsSinceMutation = lastMutationMs === null
+    ? null
+    : Math.max(0, Math.round((nowMs - lastMutationMs) / 1000));
+  const eventsSinceLatestMutation = lastMutationIndex >= 0 ? events.slice(lastMutationIndex + 1) : [];
+  const investigationsSinceLatestMutation = eventsSinceLatestMutation
+    .filter((item) => item.kind === 'investigation').length;
+  const postMutationStall = currentTurnActive
+    && currentTurnMutations >= 1
+    && secondsSinceMutation !== null
+    && secondsSinceMutation >= POST_MUTATION_STALL_SECONDS
+    && investigationsSinceLatestMutation >= POST_MUTATION_STALL_INVESTIGATIONS;
+
   return {
     compactions: events.filter((event) => event.kind === 'compaction').length,
     mutations: events.filter((event) => event.kind === 'mutation').length,
     compactionsSinceMutation: sinceMutation.compactions,
-    secondsSinceMutation: lastMutationMs === null ? null : Math.max(0, Math.round((nowMs - lastMutationMs) / 1000)),
+    secondsSinceMutation,
     implementationPhaseCommitted: sinceMutation.implementationPhaseCommitted,
     implementationPhaseReentered: sinceMutation.implementationPhaseReentered,
     postCompactionRediscovery: sinceMutation.postCompactionRediscovery,
@@ -1088,6 +1112,8 @@ export function collectProgressFacts(lines, options = {}) {
     stalledAfterGuidance: Boolean(sinceGuidance?.stalled),
     preMutationStall,
     postGuidanceStall,
+    postMutationStall,
+    investigationsSinceLatestMutation,
     currentTurnSeconds,
     currentTurnMutations,
     currentTurnInvestigations,
@@ -1219,6 +1245,11 @@ export function analyzeAgentHealth(lines, options = {}) {
   if (progress.postGuidanceStall) {
     signals.push(`post_guidance_stall: ${progress.investigationsSinceGuidance} read/search calls since parent guidance with no repository mutation`);
     concernScore += 3;
+  }
+  if (progress.postMutationStall && isQwenWorker(options.agent)) {
+    const minutes = Math.round(progress.secondsSinceMutation / 60);
+    signals.push(`post_mutation_stall: ${progress.investigationsSinceLatestMutation} read/search calls over ${minutes}m since the latest repository mutation`);
+    concernScore += 2;
   }
   if (progress.largeToolOutputs) {
     signals.push(`large_tool_output: ${progress.largeToolOutputs} tool results above ~${LARGE_TOOL_OUTPUT_TOKENS} tokens (largest ~${progress.largestToolOutputTokens}, ${progress.largestToolOutputSource})`);
@@ -1535,6 +1566,7 @@ export function formatHealthInspection(result) {
       progress_stall_after_guidance: progress.stalledAfterGuidance,
       pre_mutation_stall: progress.preMutationStall,
       post_guidance_stall: progress.postGuidanceStall,
+      post_mutation_stall: progress.postMutationStall,
       current_turn_seconds: progress.currentTurnSeconds,
       current_turn_mutations: progress.currentTurnMutations,
       current_turn_investigations: progress.currentTurnInvestigations,
@@ -1544,6 +1576,7 @@ export function formatHealthInspection(result) {
       compactions_since_mutation: progress.compactionsSinceMutation,
       mutation_events: progress.mutations,
       seconds_since_mutation: progress.secondsSinceMutation,
+      investigations_since_latest_mutation: progress.investigationsSinceLatestMutation,
       implementation_phase_committed: progress.implementationPhaseCommitted,
       implementation_phase_reentered: progress.implementationPhaseReentered,
       post_compaction_rediscovery: progress.postCompactionRediscovery,

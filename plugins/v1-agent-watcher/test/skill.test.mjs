@@ -111,6 +111,54 @@ test('the watchdog checks post_guidance_stall before the first-stall signals', a
   assert.match(skill, /Check the stall signals in this order and return on the first match/);
 });
 
+test('the watchdog recognizes the post-mutation stall between the guidance and first-stall cases', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  const postGuidance = skill.indexOf('signals include `post_guidance_stall`');
+  const postMutation = skill.indexOf('signals include `post_mutation_stall`');
+  const firstStall = skill.indexOf('signals include `progress_stall` or `pre_mutation_stall`');
+  assert.ok(postGuidance > 0 && postMutation > 0 && firstStall > 0);
+  // Explicit guidance followed by renewed investigation stays the strongest
+  // case, and a worker that already mutated must not be reported as one that
+  // never reached implementation.
+  assert.ok(postGuidance < postMutation, 'post_guidance_stall must be checked first');
+  assert.ok(postMutation < firstStall, 'post_mutation_stall must be checked before the first-stall branch');
+  assert.match(skill, /`post_guidance_stall`, then\s+`post_mutation_stall`, then `progress_stall`\/`pre_mutation_stall`/);
+  assert.match(skill, /NEEDS_SOL_REVIEW: worker changed the repository but has spent too long investigating without further mutation/);
+});
+
+test('the contract documents the post-mutation stall thresholds and its newest-mutation reset', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /### post_mutation_stall/);
+  assert.match(skill, /at least 30 minutes have elapsed since the newest mutation/);
+  assert.match(skill, /at least 10 investigation\/read\/search calls occurred after that newest mutation/);
+  assert.match(skill, /The newest mutation is the reset point, so a later edit restarts both the elapsed window and the investigation count/);
+  assert.match(skill, /It requires no compaction, no implementation-phase phrase, no parent guidance, no failed command, and no repeated command/);
+  // Qwen-only escalation, matching the pre-mutation precedent.
+  assert.match(skill, /only a Qwen worker escalates on it; for Ornith and unknown local workers the fact is reported/);
+  // seconds_since_mutation already carries the elapsed fact and is reused.
+  assert.match(skill, /`investigations_since_latest_mutation`, alongside the existing `seconds_since_mutation`/);
+});
+
+test('a first post-mutation stall keeps the same worker and only a later post-guidance stall may replace it', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /### First post-mutation stall: continue the same worker/);
+  // Earlier guidance plus a successful mutation is not "ignored guidance".
+  assert.match(skill, /A `post_mutation_stall` is not the repeated-stall case, even when the parent has already sent guidance earlier in the run/);
+  assert.match(skill, /does not mean the worker ignored parent guidance, and it does not enter the replacement path/);
+  assert.match(skill, /Preserve the implementation you already made\./);
+  assert.match(skill, /Stop expanding into adjacent approaches or validation infrastructure\./);
+  assert.match(skill, /Run the narrowest existing build\/tests that apply, then finish and report\./);
+  const section = skill.slice(skill.indexOf('### First post-mutation stall'), skill.indexOf('### Repeated progress stall after guidance'));
+  assert.match(section, /Do not replace the worker and do not spawn a second worker/);
+  assert.match(section, /first guidance -> mutation -> `post_mutation_stall` does not justify replacement/);
+  assert.match(section, /`post_mutation_stall` -> focused continuation -> `post_guidance_stall` may/);
+  // The continuation must stay generic rather than naming a framework.
+  assert.equal(/blazor|bunit|razor/i.test(section), false);
+});
+
 test('the contract separates health-window input argument names from returned field names', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 

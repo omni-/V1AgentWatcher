@@ -74,7 +74,7 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   });
 
   const initialized = await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
-  assert.equal(initialized.result.serverInfo.version, '0.6.5');
+  assert.equal(initialized.result.serverInfo.version, '0.6.6');
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'wait_v1_agent'));
@@ -100,6 +100,8 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(health.progress.progress_stall, false);
   assert.equal(health.progress.compactions_since_mutation, 0);
   assert.equal(health.progress.seconds_since_mutation, null);
+  assert.equal(health.progress.post_mutation_stall, false);
+  assert.equal(health.progress.investigations_since_latest_mutation, 0);
 
   // Regression for the benchmark failure: the watchdog read the accumulator
   // back from the returned health_window using the input argument names, got
