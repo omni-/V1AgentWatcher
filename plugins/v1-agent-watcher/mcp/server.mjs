@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import {
+  accumulateHealthWindow,
   formatAgentList,
   formatHealthInspection,
   formatInspection,
@@ -15,7 +16,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.2' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.3' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -45,6 +46,22 @@ const TOOLS = [
           default: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
           description: 'One transport-safe wait chunk. Compose chunks in the watchdog for longer health cadences.',
         },
+        health_window_ms: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself.',
+        },
+        elapsed_health_window_ms: {
+          type: 'integer',
+          minimum: 0,
+          default: 0,
+          description: 'Successful timeout-chunk time already accumulated in the current logical window. Reset to 0 after each health inspection.',
+        },
+        found_in_health_window: {
+          type: 'boolean',
+          default: false,
+          description: 'Whether an earlier completed chunk in the current logical window already observed the worker.',
+        },
       },
       required: ['thread_id'],
       additionalProperties: false,
@@ -52,7 +69,7 @@ const TOOLS = [
   },
   {
     name: 'inspect_v1_agent_health',
-    description: 'Run a small deterministic behavioral health screen for one V1 collaboration child. Detects observable looping, repeated failures/backtracking, repeated compaction, and conservative inactivity; it does not judge engineering correctness or return the detailed trace.',
+    description: 'Run a small deterministic behavioral health screen for one V1 collaboration child. Detects observable looping, repeated failures/backtracking, repeated compaction, conservative inactivity, and progress stalls where an implementation phase was committed but repeated compaction/replanning followed with no repository mutation. It does not judge engineering correctness or return the detailed trace.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -174,7 +191,28 @@ async function callTool(name, args = {}) {
         threadId: args.thread_id,
         timeoutMs: args.timeout_ms,
       });
-      return resultJson(result);
+      if (args.health_window_ms === undefined || args.health_window_ms === null) return resultJson(result);
+
+      const window = accumulateHealthWindow({
+        windowMs: args.health_window_ms,
+        elapsedMs: args.elapsed_health_window_ms,
+        foundInWindow: args.found_in_health_window,
+        outcome: result.outcome,
+        waitedMs: result.waitedMs,
+        found: result.found,
+      });
+      return resultJson({
+        ...result,
+        health_window: {
+          window_ms: window.windowMs,
+          elapsed_ms: window.elapsedMs,
+          remaining_ms: window.remainingMs,
+          next_chunk_ms: window.nextChunkMs,
+          found_in_window: window.foundInWindow,
+          inspect_now: window.inspectNow,
+          missing_window: window.missingWindow,
+        },
+      });
     }
     case 'inspect_v1_agent_health': {
       if (!args.thread_id && !args.nickname) {

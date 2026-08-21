@@ -4,7 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  accumulateHealthWindow,
   analyzeAgentHealth,
+  collectProgressFacts,
   inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
@@ -469,4 +471,272 @@ test('malformed and incomplete rollout lines do not crash summary or health insp
   const result = await inspectAgentHealth({ codexHome: root, threadId: 'child' });
   assert.equal(result.state, 'running');
   assert.equal(result.recentSummary.malformedLinesIgnored, 1);
+});
+
+function event(type, payload, timestamp) {
+  return JSON.stringify({ timestamp, type, payload });
+}
+
+function reasoningLine(text, timestamp) {
+  return event('event_msg', { type: 'agent_reasoning', text }, timestamp);
+}
+
+function shellLine(callId, command, timestamp) {
+  return event('event_msg', { type: 'exec_command_begin', call_id: callId, command }, timestamp);
+}
+
+function compactionLine(timestamp) {
+  return event('event_msg', { type: 'context_compacted' }, timestamp);
+}
+
+function patchLine(callId, timestamp) {
+  return event('response_item', {
+    type: 'function_call', call_id: callId, name: 'apply_patch', arguments: '{"input":"*** Update File: src/View.cs"}',
+  }, timestamp);
+}
+
+function userLine(text, timestamp) {
+  return event('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text }] }, timestamp);
+}
+
+// Two compaction/replanning cycles with no mutation, modeled on the observed
+// Qwen benchmark run.
+function stalledRolloutLines() {
+  return [
+    event('event_msg', { type: 'task_started' }),
+    reasoningLine('The stale row comes from the leaderboard callback. My implementation plan is to drop responses whose request token is not current.', '2026-08-20T09:00:00Z'),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src']),
+    compactionLine('2026-08-20T09:20:00Z'),
+    reasoningLine('Rebuilding context after the handoff. Let me re-read the view model.', '2026-08-20T09:21:00Z'),
+    shellLine('c2', ['rg', 'LeaderboardService', 'src']),
+    shellLine('c3', ['rg', 'incSeason', 'src']),
+    shellLine('c4', ['get-childitem', 'tests']),
+    reasoningLine('I will now apply the changes to the callback.', '2026-08-20T09:40:00Z'),
+    compactionLine('2026-08-20T09:45:00Z'),
+    shellLine('c5', ['rg', 'MockRepository', 'src']),
+    shellLine('c6', ['rg', 'MockRepository', 'tests']),
+    shellLine('c7', ['get-childitem', '-recurse', 'bin']),
+  ];
+}
+
+test('four completed found=true Qwen chunks produce exactly one health inspection at the window boundary', () => {
+  const windowMs = 900000;
+  let elapsedMs = 0;
+  let foundInWindow = false;
+  let inspections = 0;
+
+  for (let chunk = 0; chunk < 4; chunk += 1) {
+    const window = accumulateHealthWindow({
+      windowMs,
+      elapsedMs,
+      foundInWindow,
+      outcome: 'timeout',
+      waitedMs: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+      found: true,
+    });
+    elapsedMs = window.elapsedMs;
+    foundInWindow = window.foundInWindow;
+    if (window.inspectNow) inspections += 1;
+    assert.equal(window.missingWindow, false);
+  }
+
+  assert.equal(inspections, 1);
+  assert.equal(elapsedMs, windowMs);
+});
+
+test('a completed found=true chunk resets missing-worker state without inspecting early', () => {
+  const window = accumulateHealthWindow({
+    windowMs: 900000,
+    elapsedMs: 0,
+    foundInWindow: false,
+    outcome: 'timeout',
+    waitedMs: 225000,
+    found: true,
+  });
+
+  assert.equal(window.foundInWindow, true);
+  assert.equal(window.inspectNow, false);
+  assert.equal(window.missingWindow, false);
+  assert.equal(window.elapsedMs, 225000);
+  assert.equal(window.remainingMs, 675000);
+  assert.equal(window.nextChunkMs, TRANSPORT_SAFE_WAIT_TIMEOUT_MS);
+});
+
+test('a full window of found=false chunks reports one missing window instead of an inspection', () => {
+  let elapsedMs = 0;
+  let foundInWindow = false;
+  let window = null;
+  for (let chunk = 0; chunk < 4; chunk += 1) {
+    window = accumulateHealthWindow({
+      windowMs: 900000, elapsedMs, foundInWindow, outcome: 'timeout', waitedMs: 225000, found: false,
+    });
+    elapsedMs = window.elapsedMs;
+    foundInWindow = window.foundInWindow;
+  }
+
+  assert.equal(window.missingWindow, true);
+  assert.equal(window.inspectNow, false);
+});
+
+test('failed transport chunks contribute zero accumulated health-window time', () => {
+  const failed = accumulateHealthWindow({
+    windowMs: 900000, elapsedMs: 450000, foundInWindow: true, outcome: 'transport_failure', waitedMs: 225000, found: true,
+  });
+  assert.equal(failed.elapsedMs, 450000);
+  assert.equal(failed.inspectNow, false);
+
+  const unreported = accumulateHealthWindow({
+    windowMs: 900000, elapsedMs: 675000, foundInWindow: true, outcome: undefined, waitedMs: 225000,
+  });
+  assert.equal(unreported.elapsedMs, 675000);
+  assert.equal(unreported.inspectNow, false);
+});
+
+test('progress stall is reported after two compactions and replanning without mutation', () => {
+  const health = analyzeAgentHealth(stalledRolloutLines(), {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:50:00Z'),
+  });
+
+  assert.equal(health.state, 'running');
+  assert.equal(health.health, 'suspicious');
+  assert.ok(health.signals.some((signal) => signal.startsWith('progress_stall:')));
+  assert.equal(health.progress.compactionsSinceMutation, 2);
+  assert.equal(health.progress.mutations, 0);
+  assert.equal(health.progress.secondsSinceMutation, null);
+  assert.equal(health.progress.implementationPhaseCommitted, true);
+  assert.equal(health.progress.implementationPhaseReentered, true);
+  assert.equal(health.progress.postCompactionRediscovery, true);
+  assert.equal(health.progress.stalledAfterGuidance, false);
+});
+
+test('one compaction without mutation is not a progress stall', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }),
+    reasoningLine('My implementation plan is to drop stale responses.', '2026-08-20T09:00:00Z'),
+    compactionLine('2026-08-20T09:20:00Z'),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src']),
+    shellLine('c2', ['rg', 'incSeason', 'src']),
+    shellLine('c3', ['get-childitem', 'tests']),
+  ];
+
+  const health = analyzeAgentHealth(lines, { agent: { agentNickname: 'qwen' }, secondsSinceActivity: 30 });
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.stalled, false);
+  assert.equal(health.progress.compactionsSinceMutation, 1);
+});
+
+test('long reasoning without output is not a progress stall', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }),
+    reasoningLine('My implementation plan is to drop stale responses.', '2026-08-20T09:00:00Z'),
+    reasoningLine('Considering how the callback interleaves with the season change.', '2026-08-20T09:30:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 59 * 60,
+  });
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.stalled, false);
+});
+
+test('a single huge tool result is an explanatory fact, not an escalation', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }),
+    reasoningLine('My implementation plan is to drop stale responses.', '2026-08-20T09:00:00Z'),
+    shellLine('c1', ['get-childitem', '-recurse', '.']),
+    event('event_msg', { type: 'exec_command_end', call_id: 'c1', exit_code: 0, aggregated_output: 'x'.repeat(400000) }),
+  ];
+
+  const health = analyzeAgentHealth(lines, { agent: { agentNickname: 'qwen' }, secondsSinceActivity: 30 });
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.stalled, false);
+  assert.equal(health.progress.largeToolOutputs, 1);
+  assert.equal(health.progress.largestToolOutputSource, 'estimated');
+  assert.ok(health.signals.some((signal) => signal.startsWith('large_tool_output:')));
+});
+
+test('persisted tool-result token metadata is preferred over a character estimate', () => {
+  const facts = collectProgressFacts([
+    event('response_item', {
+      type: 'function_call_output',
+      call_id: 'c1',
+      output: { output: 'short', metadata: { original_token_count: 82000 } },
+    }),
+  ]);
+
+  assert.equal(facts.largeToolOutputs, 1);
+  assert.equal(facts.largestToolOutputTokens, 82000);
+  assert.equal(facts.largestToolOutputSource, 'metadata');
+});
+
+test('investigation followed by a repository mutation stays healthy', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }),
+    reasoningLine('My implementation plan is to drop stale responses.', '2026-08-20T09:00:00Z'),
+    shellLine('c1', ['rg', 'LeaderboardService', 'src']),
+    shellLine('c2', ['rg', 'incSeason', 'src']),
+    shellLine('c3', ['get-childitem', 'tests']),
+    patchLine('c4', '2026-08-20T09:10:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:12:00Z'),
+  });
+  assert.equal(health.health, 'healthy');
+  assert.equal(health.progress.stalled, false);
+  assert.equal(health.progress.mutations, 1);
+  assert.equal(health.progress.secondsSinceMutation, 120);
+});
+
+test('a repository mutation resets accumulated progress-stall evidence', () => {
+  const facts = collectProgressFacts([
+    ...stalledRolloutLines(),
+    patchLine('c8', '2026-08-20T09:50:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:51:00Z') });
+
+  assert.equal(facts.stalled, false);
+  assert.equal(facts.compactionsSinceMutation, 0);
+  assert.equal(facts.implementationPhaseCommitted, false);
+  assert.equal(facts.mutations, 1);
+  assert.equal(facts.secondsSinceMutation, 60);
+});
+
+test('a stall that repeats after parent guidance is distinguished from the first stall', () => {
+  const first = collectProgressFacts([userLine('Fix the stale leaderboard row.'), ...stalledRolloutLines()]);
+  assert.equal(first.stalled, true);
+  assert.equal(first.guidanceMessages, 0);
+  assert.equal(first.stalledAfterGuidance, false);
+
+  const repeated = collectProgressFacts([
+    userLine('Fix the stale leaderboard row.'),
+    ...stalledRolloutLines(),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:50:00Z'),
+    reasoningLine('Understood. My implementation plan is unchanged.', '2026-08-20T09:51:00Z'),
+    compactionLine('2026-08-20T10:05:00Z'),
+    shellLine('d1', ['rg', 'LeaderboardService', 'src']),
+    reasoningLine('I will now apply the changes to the callback.', '2026-08-20T10:20:00Z'),
+    compactionLine('2026-08-20T10:25:00Z'),
+    shellLine('d2', ['rg', 'MockRepository', 'src']),
+    shellLine('d3', ['rg', 'MockRepository', 'tests']),
+    shellLine('d4', ['get-childitem', 'tests']),
+  ]);
+
+  assert.equal(repeated.guidanceMessages, 1);
+  assert.equal(repeated.stalled, true);
+  assert.equal(repeated.stalledAfterGuidance, true);
+});
+
+test('a compaction bridge summary is not counted as parent guidance', () => {
+  const facts = collectProgressFacts([
+    userLine('Fix the stale leaderboard row.'),
+    compactionLine('2026-08-20T09:20:00Z'),
+    userLine('Summary of the previous session: the callback drops nothing yet.', '2026-08-20T09:20:01Z'),
+  ]);
+
+  assert.equal(facts.guidanceMessages, 0);
 });
