@@ -98,3 +98,15 @@ test('the contract scopes the pre-mutation stall to Qwen and excludes framework 
   assert.match(skill, /For Ornith and unknown local workers the fact is still reported/);
   assert.match(skill, /not a framework `<environment_context>` preamble/);
 });
+
+test('the watchdog checks post_guidance_stall before the first-stall signals', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  const postGuidance = skill.indexOf('signals include `post_guidance_stall`');
+  const firstStall = skill.indexOf('signals include `progress_stall` or `pre_mutation_stall`');
+  assert.ok(postGuidance > 0 && firstStall > 0);
+  // A worker stalling after guidance raises the first-stall signals too, so the
+  // weaker line must not be able to match first and hide the repeated stall.
+  assert.ok(postGuidance < firstStall, 'post_guidance_stall must be checked first');
+  assert.match(skill, /Check the stall signals in this order and return on the first match/);
+});

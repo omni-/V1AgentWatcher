@@ -144,10 +144,11 @@ Loop internally:
 - If state is idle/completed, return exactly:
   DONE: worker completed
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
-- If health is suspicious and its signals include `progress_stall` or `pre_mutation_stall`, return exactly:
-  NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation
+- Check the stall signals in this order and return on the first match. A worker that stalls after guidance usually raises the earlier signals too, so checking `post_guidance_stall` first is what keeps the repeated-stall case distinguishable from the first stall.
 - If health is suspicious and its signals include `post_guidance_stall`, return exactly:
   NEEDS_SOL_REVIEW: worker resumed investigating after parent guidance without mutating the repository
+- Otherwise, if health is suspicious and its signals include `progress_stall` or `pre_mutation_stall`, return exactly:
+  NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation
 - If health is otherwise suspicious, unreadable, aborted, or errored, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence copied or summarized only from the observable health signal>
 - Provider and cwd values are diagnostic context, not identity constraints. Persisted cwd can reflect the parent launch context even when the worker correctly changed its shell cwd.
