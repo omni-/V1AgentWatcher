@@ -7,6 +7,7 @@ import {
   accumulateHealthWindow,
   analyzeAgentHealth,
   collectProgressFacts,
+  formatHealthWindow,
   inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
@@ -552,6 +553,83 @@ test('four completed found=true Qwen chunks produce exactly one health inspectio
 
   assert.equal(inspections, 1);
   assert.equal(elapsedMs, windowMs);
+});
+
+test('a watchdog reading the health-window aliases still reaches the 900000 ms inspection boundary', () => {
+  const windowMs = 900000;
+  // The benchmark watchdog read the accumulator back through the tool's INPUT
+  // argument names. With the compatibility aliases that mistake is harmless.
+  let sent = { elapsed_health_window_ms: 0, found_in_health_window: false };
+  const elapsedPerChunk = [];
+  let inspections = 0;
+  let last = null;
+
+  for (let chunk = 0; chunk < 4; chunk += 1) {
+    last = formatHealthWindow(accumulateHealthWindow({
+      windowMs,
+      elapsedMs: sent.elapsed_health_window_ms,
+      foundInWindow: sent.found_in_health_window,
+      outcome: 'timeout',
+      waitedMs: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+      found: true,
+    }));
+    elapsedPerChunk.push(last.elapsed_ms);
+    if (last.inspect_now) inspections += 1;
+    sent = {
+      elapsed_health_window_ms: last.elapsed_health_window_ms,
+      found_in_health_window: last.found_in_health_window,
+    };
+  }
+
+  assert.deepEqual(elapsedPerChunk, [225000, 450000, 675000, 900000]);
+  assert.equal(inspections, 1);
+  assert.equal(last.inspect_now, true);
+  assert.equal(last.missing_window, false);
+  assert.equal(sent.found_in_health_window, true);
+});
+
+test('the health-window aliases carry exactly the canonical values', () => {
+  const found = formatHealthWindow(accumulateHealthWindow({
+    windowMs: 900000, elapsedMs: 675000, foundInWindow: true, outcome: 'timeout', waitedMs: 225000, found: true,
+  }));
+  assert.equal(found.elapsed_health_window_ms, found.elapsed_ms);
+  assert.equal(found.found_in_health_window, found.found_in_window);
+  assert.equal(found.elapsed_health_window_ms, 900000);
+  assert.equal(found.found_in_health_window, true);
+
+  const missing = formatHealthWindow(accumulateHealthWindow({
+    windowMs: 900000, elapsedMs: 675000, foundInWindow: false, outcome: 'timeout', waitedMs: 225000, found: false,
+  }));
+  assert.equal(missing.elapsed_health_window_ms, missing.elapsed_ms);
+  assert.equal(missing.found_in_health_window, missing.found_in_window);
+  assert.equal(missing.found_in_health_window, false);
+  assert.equal(missing.missing_window, true);
+});
+
+test('resending zero accumulator state is the benchmark failure the aliases prevent', () => {
+  const observed = [];
+  for (let chunk = 0; chunk < 4; chunk += 1) {
+    // The failing watchdog read undefined field names, so every chunk was sent
+    // with elapsed_health_window_ms: 0 and found_in_health_window: false.
+    const window = formatHealthWindow(accumulateHealthWindow({
+      windowMs: 900000,
+      elapsedMs: 0,
+      foundInWindow: false,
+      outcome: 'timeout',
+      waitedMs: 225000,
+      found: true,
+    }));
+    observed.push({ elapsedMs: window.elapsed_ms, inspectNow: window.inspect_now });
+  }
+
+  // Four chunks, each looking like the first chunk of a brand new window: the
+  // 900000 ms boundary is never reached and the stall screen never runs.
+  assert.deepEqual(observed, [
+    { elapsedMs: 225000, inspectNow: false },
+    { elapsedMs: 225000, inspectNow: false },
+    { elapsedMs: 225000, inspectNow: false },
+    { elapsedMs: 225000, inspectNow: false },
+  ]);
 });
 
 test('a completed found=true chunk resets missing-worker state without inspecting early', () => {

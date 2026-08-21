@@ -110,3 +110,20 @@ test('the watchdog checks post_guidance_stall before the first-stall signals', a
   assert.ok(postGuidance < firstStall, 'post_guidance_stall must be checked first');
   assert.match(skill, /Check the stall signals in this order and return on the first match/);
 });
+
+test('the contract separates health-window input argument names from returned field names', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /elapsed_health_window_ms\s+<-\s+health_window\.elapsed_ms/);
+  assert.match(skill, /found_in_health_window\s+<-\s+health_window\.found_in_window/);
+  assert.match(skill, /`elapsed_health_window_ms` and `found_in_health_window` are input argument\s+names/);
+  // The parent prompt must carry the assignment itself, not a paraphrase that
+  // lets Luna infer the returned fields use the input argument names.
+  assert.match(skill, /elapsed_health_window_ms = result\.health_window\.elapsed_ms/);
+  assert.match(skill, /found_in_health_window\s+= result\.health_window\.found_in_window/);
+  assert.match(skill, /Include the health-window accumulator mapping and its two assignment lines verbatim/);
+  assert.match(skill, /Never re-send\s+`elapsed_health_window_ms: 0` after a completed chunk/);
+  // The canonical loop keeps reading the canonical fields.
+  assert.match(skill, /elapsedMs = last\.health_window\.elapsed_ms;/);
+  assert.match(skill, /foundInWindow = last\.health_window\.found_in_window;/);
+});

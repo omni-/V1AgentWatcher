@@ -74,7 +74,7 @@ Do not call the accounting MCP operation automatically at the end of supervision
 
 ## Watchdog prompt
 
-Give Luna the following contract, substituting the worker ID, kind, provider, and cwd:
+Give Luna the following contract, substituting the worker ID, kind, provider, and cwd. Include the health-window accumulator mapping and its two assignment lines verbatim; do not paraphrase them as “track `elapsed_health_window_ms` and `found_in_health_window` via the fields the tool returns”, which invites Luna to assume the returned fields carry the input argument names:
 
 ```text
 You are a V1 subagent-progress watchdog.
@@ -129,7 +129,33 @@ Loop internally:
   text(JSON.stringify({ last, elapsedMs, foundInWindow, failures }));
   ```
 
-  Every individual MCP wait stays at or below 225000 ms, so no single request exceeds the transport-safe limit. The loop never calls `wait(cell_id)` and never creates a background cell. A `completed` or `terminal_error` chunk breaks out immediately, so worker completion still wakes the watchdog early. If the runtime rejects the full-window outer yield, fall back to exactly one 225000 ms chunk per Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin, and carry `elapsed_health_window_ms` and `found_in_health_window` across your own turns. The inspection cadence below is identical either way.
+  The accumulator argument names and the returned field names are deliberately
+  different. Map them exactly:
+
+  ```text
+  INPUT (argument you send)          OUTPUT (field the tool returns)
+  elapsed_health_window_ms    <-     health_window.elapsed_ms
+  found_in_health_window      <-     health_window.found_in_window
+  ```
+
+  `elapsed_health_window_ms` and `found_in_health_window` are input argument
+  names. The canonical returned fields are `health_window.elapsed_ms` and
+  `health_window.found_in_window`. After each completed timeout, assign exactly:
+
+  ```text
+  elapsed_health_window_ms = result.health_window.elapsed_ms
+  found_in_health_window   = result.health_window.found_in_window
+  ```
+
+  The returned `health_window` also carries `elapsed_health_window_ms` and
+  `found_in_health_window` compatibility aliases holding identical values, so
+  either spelling on the returned object is safe; the canonical example above
+  keeps using `elapsed_ms` / `found_in_window`. Never re-send
+  `elapsed_health_window_ms: 0` after a completed chunk: that restarts the
+  logical window, so every chunk looks like the first one and
+  `health_window.inspect_now` never becomes true.
+
+  Every individual MCP wait stays at or below 225000 ms, so no single request exceeds the transport-safe limit. The loop never calls `wait(cell_id)` and never creates a background cell. A `completed` or `terminal_error` chunk breaks out immediately, so worker completion still wakes the watchdog early. If the runtime rejects the full-window outer yield, fall back to exactly one 225000 ms chunk per Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin, and carry `elapsed_health_window_ms` and `found_in_health_window` across your own turns using the assignment above. The inspection cadence below is identical either way.
 - Do not call `wait(cell_id)` to finish an otherwise healthy MCP chunk. An unexpected Code Mode background-cell yield is an enclosing runtime failure, not a completed MCP timeout and not evidence about worker health; return `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` instead of polling that cell.
 - If `wait_v1_agent` reports `completed`, return exactly:
   DONE: worker completed

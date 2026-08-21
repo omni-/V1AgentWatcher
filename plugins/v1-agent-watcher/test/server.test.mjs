@@ -74,7 +74,7 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   });
 
   const initialized = await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
-  assert.equal(initialized.result.serverInfo.version, '0.6.4');
+  assert.equal(initialized.result.serverInfo.version, '0.6.5');
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'wait_v1_agent'));
@@ -100,6 +100,33 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(health.progress.progress_stall, false);
   assert.equal(health.progress.compactions_since_mutation, 0);
   assert.equal(health.progress.seconds_since_mutation, null);
+
+  // Regression for the benchmark failure: the watchdog read the accumulator
+  // back from the returned health_window using the input argument names, got
+  // undefined, and resent zero state on every chunk. A timeout response must
+  // therefore expose both spellings with identical values.
+  const timedOut = await rpc(7, 'tools/call', {
+    name: 'wait_v1_agent',
+    arguments: {
+      thread_id: 'qwen-thread',
+      timeout_ms: 1000,
+      health_window_ms: 900000,
+      elapsed_health_window_ms: 450000,
+      found_in_health_window: true,
+    },
+  });
+  assert.equal(timedOut.result.isError, undefined);
+  assert.equal(timedOut.result.structuredContent.outcome, 'timeout');
+  const timedOutWindow = timedOut.result.structuredContent.health_window;
+  assert.ok(timedOutWindow.elapsed_ms > 450000);
+  assert.equal(timedOutWindow.elapsed_health_window_ms, timedOutWindow.elapsed_ms);
+  assert.equal(timedOutWindow.found_in_window, true);
+  assert.equal(timedOutWindow.found_in_health_window, timedOutWindow.found_in_window);
+  // A Code Mode client may parse the text content instead of structuredContent,
+  // so the aliases must survive serialization too.
+  const timedOutText = JSON.parse(timedOut.result.content[0].text).health_window;
+  assert.equal(timedOutText.elapsed_health_window_ms, timedOutText.elapsed_ms);
+  assert.equal(timedOutText.found_in_health_window, timedOutText.found_in_window);
 
   await fs.appendFile(
     path.join(sessions, 'rollout-qwen.jsonl'),
@@ -133,6 +160,8 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(window.next_chunk_ms, 225000);
   assert.equal(window.inspect_now, false);
   assert.equal(window.missing_window, false);
+  assert.equal(window.elapsed_health_window_ms, window.elapsed_ms);
+  assert.equal(window.found_in_health_window, window.found_in_window);
 
   const usage = await rpc(4, 'tools/call', {
     name: 'inspect_v1_agent_usage',
