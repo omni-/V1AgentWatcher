@@ -1,6 +1,6 @@
 {
   "name": "v1-agent-watcher",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Supervise Codex V1 child agents and inspect exact post-hoc rollout token usage.",
   "author": {
     "name": "omni-"
