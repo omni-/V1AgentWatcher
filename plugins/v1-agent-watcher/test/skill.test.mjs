@@ -48,6 +48,24 @@ test('a first progress stall continues the same worker and a repeated stall may 
   assert.match(skill, /Do not add progress polling/);
 });
 
+test('Qwen delegation requires the registered qwen role and forbids a worker model override', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /## Worker role selection/);
+  assert.match(skill, /For Qwen delegation, spawn the registered `qwen` agent type\/role\./);
+  assert.match(skill, /Never emulate the Qwen role by spawning `agent_type="worker"` with `model="qwen3\.8-27b-uncensored-sharp"`/);
+  // A model override carries no role configuration, so the local model is
+  // routed through the parent's provider.
+  assert.match(skill, /does not carry the role's `model_provider="lmstudio"` configuration/);
+  assert.match(skill, /fail immediately and report that the configured Qwen role is unavailable/);
+  assert.match(skill, /Do not substitute `worker` plus a Qwen model override/);
+  // The spawn contract itself must carry the rule, not only the later section.
+  const spawnContract = skill.slice(0, skill.indexOf('## Worker role selection'));
+  assert.match(spawnContract, /never emulate it with a generic\s+`worker` spawn plus a Qwen model override/);
+  // The Luna model-only spawn must not be readable as precedent for the worker.
+  assert.match(skill, /That model-only spawn is specific to the watchdog/);
+});
+
 test('local-worker reasoning documents inheritance rather than claiming omission suppresses the warning', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 
