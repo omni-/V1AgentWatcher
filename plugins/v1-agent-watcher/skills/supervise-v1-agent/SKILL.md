@@ -15,10 +15,12 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
    - low reasoning effort
    - no forked parent context when the spawn API exposes that choice
    - the exact worker thread ID and worker kind (`qwen`, `ornith`, or unknown) in its initial message
-3. Wait on the watchdog, not the worker. Use the native V1 `wait_agent` with the watchdog thread ID and a long timeout, up to 3,600,000 ms when supported. The wait returns early when the watchdog finishes. If that outer wait itself times out, wait on the same watchdog again without inspecting the worker.
+3. Wait on the watchdog, not the worker. Call the native V1 `wait_agent` on the watchdog thread and explicitly set `timeout_ms=3600000`; do not rely on the tool's default timeout. The wait returns early when the watchdog finishes. If that outer wait times out without a terminal watchdog result, immediately call `wait_agent` again on the same watchdog with `timeout_ms=3600000`. Between healthy outer waits, do not inspect the worker or watchdog, emit progress commentary, summarize status, or perform any other parent work.
 4. The watchdog stays silent while the worker is healthy. It returns only when the worker completes or observable behavior warrants parent attention.
 5. After `DONE`, the parent reviews the worker's final changes normally. After `NEEDS_SOL_REVIEW`, the parent may call `inspect_v1_agent` for a small detailed window and decide whether queued guidance is needed.
 6. Retain the exact worker and watchdog thread IDs in the final report so the human can measure the completed run afterward with `v1usage -Worker <worker-id> -Watchdog <watchdog-id>`.
+
+After the watchdog is spawned, the parent must remain silent until the watchdog returns `DONE` or `NEEDS_SOL_REVIEW`, the user provides new input, or an actual tool/runtime error requires parent action. A healthy `wait_agent` timeout is not a progress event and must not produce a parent update; re-enter the same explicit one-hour wait immediately.
 
 Always address the worker by exact `thread_id`. A watchdog is itself a child rollout and may be newer than the worker, so latest-session selection is unsafe after the watchdog has been spawned.
 
