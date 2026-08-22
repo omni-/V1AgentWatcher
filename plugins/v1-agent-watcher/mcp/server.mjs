@@ -52,24 +52,24 @@ const TOOLS = [
         health_window_ms: {
           type: 'integer',
           minimum: 1,
-          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself. The accumulator is stateless, so chunks composing one logical window may run in separate watchdog turns: send the returned health_window.next_wait_args back on the following chunk.',
+          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself. The accumulator is stateless, so chunks composing one logical window may run in separate watchdog turns: send the returned health_window.next_wait_args back verbatim on the following chunk. The other returned health_window fields describe the chunk that just finished and are diagnostics, not next-call values.',
         },
         elapsed_health_window_ms: {
           type: 'integer',
           minimum: 0,
           default: 0,
-          description: 'Successful timeout-chunk time already accumulated in the current logical window. Carry it forward from the returned health_window.next_wait_args.elapsed_health_window_ms, or equivalently from health_window.elapsed_ms (aliased as health_window.elapsed_health_window_ms) until a completed window resets it to 0.',
+          description: 'Successful timeout-chunk time already accumulated in the current logical window. Always take it from the previous result\'s health_window.next_wait_args.elapsed_health_window_ms. Do not rebuild it from health_window.elapsed_ms, which reports the window that just finished and differs from the next call\'s value at a window boundary.',
         },
         found_in_health_window: {
           type: 'boolean',
           default: false,
-          description: 'Whether an earlier completed chunk in the current logical window already observed the worker. Carry it forward from the returned health_window.next_wait_args.found_in_health_window, or equivalently from health_window.found_in_window (aliased as health_window.found_in_health_window).',
+          description: 'Whether an earlier completed chunk in the current logical window already observed the worker. Always take it from the previous result\'s health_window.next_wait_args.found_in_health_window. Do not rebuild it from health_window.found_in_window, which reports the window that just finished and is reset for the next call at a window boundary.',
         },
         missing_health_windows: {
           type: 'integer',
           minimum: 0,
           default: 0,
-          description: 'Consecutive fully completed logical windows in which no chunk ever observed the worker. Carry it forward from the returned health_window.missing_health_windows so the count survives watchdog turn boundaries. The tool increments it only when a whole window completes unseen and clears it as soon as any chunk observes the worker.',
+          description: 'Consecutive fully completed logical windows in which no chunk ever observed the worker. Take it from the previous result\'s health_window.next_wait_args.missing_health_windows so the count survives watchdog turn boundaries. The tool increments it only when a whole window completes unseen and clears it as soon as any chunk observes the worker.',
         },
       },
       required: ['thread_id'],

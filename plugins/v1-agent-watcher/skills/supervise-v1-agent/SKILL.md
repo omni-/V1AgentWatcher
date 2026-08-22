@@ -135,7 +135,7 @@ NEEDS_SOL_RELAY: <the exact guidance text Luna wants delivered to the worker>
 
 ## Watchdog prompt
 
-Give Luna the following contract, substituting the worker ID, kind, provider, and cwd. Include the health-window accumulator mapping and its two assignment lines verbatim; do not paraphrase them as “track `elapsed_health_window_ms` and `found_in_health_window` via the fields the tool returns”, which invites Luna to assume the returned fields carry the input argument names:
+Give Luna the following contract, substituting the worker ID, kind, provider, and cwd. Include the `next_wait_args` continuation rule and its diagnostics-only list verbatim; do not paraphrase them as “carry the health-window state forward from the fields the tool returns”, which invites Luna to rebuild the next call from `health_window.elapsed_ms` and `health_window.found_in_window` and so to carry a completed window's totals into the window that follows it:
 
 ```text
 You are the routine supervisor for a V1 subagent. You own normal supervision of
@@ -200,33 +200,34 @@ Loop internally:
   - `inspect_health` — this chunk completed the logical window and the worker was observed. Run exactly one `inspect_v1_agent_health`, act on it per the rules below, then send the next chunk.
   - `note_missing_window` — the window completed without any chunk observing the worker. Do not inspect; check `missing_health_windows` against the escalation limit, then send the next chunk.
 
-  The accumulator argument names and the returned field names are deliberately
-  different. Map them exactly:
+  For the next wait call, copy `health_window.next_wait_args` exactly. That is
+  the only source of continuation arguments.
+
+  Do not reconstruct continuation arguments from `health_window.elapsed_ms` or
+  `health_window.found_in_window`. Those fields describe the window that just
+  completed; at a logical-window boundary they intentionally differ from the
+  already-reset values in `next_wait_args`:
 
   ```text
-  INPUT (argument you send)          OUTPUT (field the tool returns)
-  elapsed_health_window_ms    <-     health_window.elapsed_ms
-  found_in_health_window      <-     health_window.found_in_window
-  missing_health_windows      <-     health_window.missing_health_windows
+  NEXT CALL          <-  health_window.next_wait_args   (always, verbatim)
+
+  DIAGNOSTICS ONLY   <-  health_window.elapsed_ms
+                         health_window.found_in_window
+                         health_window.missing_health_windows
+                         and the elapsed_health_window_ms /
+                         found_in_health_window aliases of the first two
   ```
 
-  `elapsed_health_window_ms` and `found_in_health_window` are input argument
-  names. The canonical returned fields are `health_window.elapsed_ms` and
-  `health_window.found_in_window`. After each completed timeout, assign exactly:
+  On the fourth Qwen chunk the result reads `elapsed_ms: 900000` and
+  `found_in_window: true`, describing the window that just finished, while
+  `next_wait_args` correctly reads `elapsed_health_window_ms: 0` and
+  `found_in_health_window: false` for the window that starts next. Carrying
+  900000/true forward would make the very next 225000 ms chunk look like
+  another completed window, and you would inspect health every chunk instead
+  of every 15 minutes.
 
-  ```text
-  elapsed_health_window_ms = result.health_window.elapsed_ms
-  found_in_health_window   = result.health_window.found_in_window
-  missing_health_windows   = result.health_window.missing_health_windows
-  ```
-
-  The returned `health_window` also carries `elapsed_health_window_ms` and
-  `found_in_health_window` compatibility aliases holding identical values, so
-  either spelling on the returned object is safe; the canonical example above
-  keeps using `elapsed_ms` / `found_in_window`. Never re-send
-  `elapsed_health_window_ms: 0` after a completed chunk: that restarts the
-  logical window, so every chunk looks like the first one and
-  `health_window.inspect_now` never becomes true.
+  The diagnostic fields are safe to read and to report. They are never
+  next-call values.
 
 - A Code Mode execution ending between chunks is ordinary continuation, not failure. It contributes nothing to any failure count, it does not wake the parent, and it never justifies a `NEEDS_SOL_REVIEW` by itself. Read the accumulator out of the last chunk result and issue the next chunk.
 - Never end your agent turn between chunks. Do not emit a message, a status line, a healthy-chunk summary, or any other final text between waits; issue the next chunk directly. The parent is blocked in one native wait on you, and any message you finish on ends your turn and wakes it. Only the terminal lines below may end your turn.
@@ -237,7 +238,7 @@ Loop internally:
 - Only a returned `outcome: timeout` is a completed wait chunk, and only a completed chunk contributes its actual `waitedMs` to the current logical health window. A tool exception, MCP failure, transport timeout, or Code Mode yield failure contributes ZERO elapsed health-window time, says nothing about worker presence or health, and must never increment the missing-worker count.
 - A completed chunk with `found=true` immediately resets the missing-worker window count and contributes its `waitedMs` to the current logical window. It does NOT trigger a health inspection by itself. Never call inspect_v1_agent_health merely because a chunk returned.
 - Call inspect_v1_agent_health exactly once per completed logical health window, only when `health_window.inspect_now` is true — that is, only after completed timeout chunks have accumulated the full window and at least one of them observed the worker. For Qwen this means four completed 225000 ms chunks produce one inspection at 900000 ms, not four inspections.
-- After that inspection, reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false, then begin another complete window. The `next_wait_args` returned by the boundary chunk already carries that reset, so sending it verbatim after the inspection is correct.
+- After that inspection, begin another complete window. The `next_wait_args` returned by the boundary chunk already carries the reset — `elapsed_health_window_ms: 0` and `found_in_health_window: false` — so sending it verbatim after the inspection is all that is required. Do not re-derive those values, and do not carry the completed window's `elapsed_ms` into the new one.
 - `health_window.missing_window` true means a full window completed with every chunk reporting `found=false`. The tool has already counted it in `health_window.missing_health_windows` and already reset the window inside `next_wait_args`, so do not inspect and do not recount it yourself. Any later chunk that observes the worker clears that count. Escalate only after three consecutive full missing windows, that is only once `health_window.missing_health_windows` reaches 3.
 - Retry a failed transport chunk with the accumulator values unchanged, since a failed chunk observed nothing and changed nothing. If three consecutive transport/tool failures prevent observation, return `NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts`; do not describe the worker as missing or unhealthy. A chunk that completed normally clears the consecutive-failure count even if your turn ended before the next chunk began.
 - If state is idle/completed, produce the completion handoff and return `DONE`.

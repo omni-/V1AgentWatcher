@@ -72,8 +72,7 @@ test('v0.7.1: accumulator state is carried as literals because Code Mode scope d
   assert.match(skill, /The accumulator lives in the arguments you send and the fields the tool returns, never in a live execution/);
   // The second-chunk example must actually carry non-zero accumulator state.
   assert.match(skill, /elapsed_health_window_ms: 225000,\s*\n\s*found_in_health_window: true/);
-  assert.match(skill, /missing_health_windows      <-     health_window\.missing_health_windows/);
-  assert.match(skill, /missing_health_windows   = result\.health_window\.missing_health_windows/);
+  assert.match(skill, /the carried `elapsed_health_window_ms`, `found_in_health_window`, and `missing_health_windows`/);
 });
 
 test('v0.7.1: next_action drives the boundary instead of watchdog arithmetic', async () => {
@@ -93,7 +92,8 @@ test('the health-window contract inspects once per completed logical window', as
   assert.match(skill, /Never call inspect_v1_agent_health merely because a chunk returned/);
   assert.match(skill, /exactly once per completed logical health window/);
   assert.match(skill, /four completed 225000 ms chunks produce one inspection at 900000 ms, not four inspections/);
-  assert.match(skill, /reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false/);
+  // v0.7.1: the boundary reset is delivered by the tool, not performed by hand.
+  assert.match(skill, /already carries the reset — `elapsed_health_window_ms: 0` and `found_in_health_window: false`/);
   // The window boundary is computed by the tool, not by watchdog arithmetic.
   assert.match(skill, /health_window\.inspect_now/);
   assert.match(skill, /health_window\.missing_window/);
@@ -248,22 +248,43 @@ test('a first post-mutation stall keeps the same worker and only a later post-gu
   assert.equal(/blazor|bunit|razor/i.test(section), false);
 });
 
-test('the contract separates health-window input argument names from returned field names', async () => {
+test('v0.7.1: next_wait_args is the only prescribed source of continuation arguments', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 
-  assert.match(skill, /elapsed_health_window_ms\s+<-\s+health_window\.elapsed_ms/);
-  assert.match(skill, /found_in_health_window\s+<-\s+health_window\.found_in_window/);
-  assert.match(skill, /`elapsed_health_window_ms` and `found_in_health_window` are input argument\s+names/);
-  // The parent prompt must carry the assignment itself, not a paraphrase that
-  // lets Luna infer the returned fields use the input argument names.
-  assert.match(skill, /elapsed_health_window_ms = result\.health_window\.elapsed_ms/);
-  assert.match(skill, /found_in_health_window\s+= result\.health_window\.found_in_window/);
-  assert.match(skill, /Include the health-window accumulator mapping and its two assignment lines verbatim/);
-  assert.match(skill, /Never re-send\s+`elapsed_health_window_ms: 0` after a completed chunk/);
-  // v0.7.1 carries the same canonical fields across turns instead of through
-  // loop variables, so the mapping is asserted on the carry contract itself.
+  assert.match(skill, /For the next wait call, copy `health_window\.next_wait_args` exactly\. That is\s+the only source of continuation arguments\./);
   assert.match(skill, /`next_wait_args` already contains the post-boundary reset/);
-  assert.match(skill, /The `next_wait_args` returned by the boundary chunk already carries that reset/);
+  assert.match(skill, /The `next_wait_args` returned by the boundary chunk already carries the reset/);
+  assert.match(skill, /Include the `next_wait_args` continuation rule and its diagnostics-only list verbatim/);
+
+  // The v0.6.5 reconstruction recipe is equivalent to next_wait_args inside an
+  // incomplete window and WRONG at a boundary, where next_wait_args has already
+  // reset. Following it after the fourth Qwen chunk starts the next window at
+  // 900000/true, so the very next chunk looks like another completed window and
+  // health is inspected every chunk instead of every 15 minutes.
+  assert.equal(/elapsed_health_window_ms = result\.health_window\.elapsed_ms/.test(skill), false);
+  assert.equal(/found_in_health_window\s+= result\.health_window\.found_in_window/.test(skill), false);
+  assert.equal(/elapsed_health_window_ms\s+<-\s+health_window\.elapsed_ms/.test(skill), false);
+  assert.equal(/found_in_health_window\s+<-\s+health_window\.found_in_window/.test(skill), false);
+  assert.equal(/After each completed timeout, assign exactly/.test(skill), false);
+  // This line was itself inverted at a boundary, where 0 is the correct value.
+  assert.equal(/Never re-send\s+`elapsed_health_window_ms: 0` after a completed chunk/.test(skill), false);
+});
+
+test('v0.7.1: the raw accumulator fields are labelled diagnostics, not next-call values', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /Do not reconstruct continuation arguments from `health_window\.elapsed_ms` or\s+`health_window\.found_in_window`/);
+  assert.match(skill, /at a logical-window boundary they intentionally differ from the\s+already-reset values in `next_wait_args`/);
+  assert.match(skill, /NEXT CALL\s+<-\s+health_window\.next_wait_args\s+\(always, verbatim\)/);
+  assert.match(skill, /DIAGNOSTICS ONLY\s+<-\s+health_window\.elapsed_ms/);
+  assert.match(skill, /The diagnostic fields are safe to read and to report\. They are never\s+next-call values\./);
+
+  // The concrete boundary case must be spelled out, since that is the only
+  // place the two recipes disagree.
+  assert.match(skill, /On the fourth Qwen chunk the result reads `elapsed_ms: 900000` and\s+`found_in_window: true`/);
+  assert.match(skill, /`next_wait_args` correctly reads `elapsed_health_window_ms: 0` and\s+`found_in_health_window: false`/);
+  assert.match(skill, /you would inspect health every chunk instead\s+of every 15 minutes/);
+  assert.match(skill, /do not carry the completed window's `elapsed_ms` into the new one/);
 });
 
 test('the parent delegates routine supervision and never polls the worker', async () => {

@@ -95,6 +95,16 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   // the watchdog turn boundaries that now compose one logical window.
   assert.equal(waitTool.inputSchema.properties.missing_health_windows.default, 0);
   assert.equal(waitTool.inputSchema.properties.missing_health_windows.minimum, 0);
+  // The schema must name next_wait_args as the single continuation source. An
+  // "or equivalently, health_window.elapsed_ms" reading is correct mid-window
+  // and wrong at a boundary, so it must not appear.
+  for (const field of ['elapsed_health_window_ms', 'found_in_health_window', 'missing_health_windows']) {
+    const description = waitTool.inputSchema.properties[field].description;
+    assert.match(description, /next_wait_args/);
+    assert.equal(/or equivalently/.test(description), false);
+  }
+  assert.match(waitTool.inputSchema.properties.elapsed_health_window_ms.description, /Do not rebuild it from health_window\.elapsed_ms/);
+  assert.match(waitTool.inputSchema.properties.found_in_health_window.description, /Do not rebuild it from health_window\.found_in_window/);
 
   const inspected = await rpc(3, 'tools/call', {
     name: 'inspect_v1_agent_health',
