@@ -1313,6 +1313,68 @@ function postMutationRolloutLines(investigations = 12, mutationIso = '2026-08-20
   ];
 }
 
+// The literal edit mechanism from Qwen's developer prompt. Codex persists the
+// whole PowerShell script, so the patch body travels with the command and the
+// hyphenated flag is the only thing that identifies it as a repository write.
+function codexApplyPatchLine(callId, timestamp, file = 'src/LeaderboardService.cs') {
+  const script = [
+    "$patch = @'",
+    '*** Begin Patch',
+    `*** Update File: ${file}`,
+    '@@',
+    '-        _rows = rows;',
+    '+        if (token != _currentToken) return;',
+    '*** End Patch',
+    "'@",
+    '& $codex --codex-run-as-apply-patch $patch',
+  ].join('\n');
+  return shellLine(callId, ['pwsh', '-Command', script], timestamp);
+}
+
+test('the Codex apply-patch invocation Qwen actually uses counts as a repository mutation', () => {
+  const facts = collectProgressFacts([
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    codexApplyPatchLine('m1', '2026-08-20T09:05:00Z'),
+  ], { nowMs: Date.parse('2026-08-20T09:06:00Z') });
+
+  // Regression: '--codex-run-as-apply-patch' is hyphenated, so the underscored
+  // 'apply_patch' spelling never matched it and every real Qwen edit persisted
+  // as a non-mutation.
+  assert.equal(facts.mutations, 1);
+  assert.equal(facts.currentTurnMutations, 1);
+  assert.equal(facts.currentTurnInvestigations, 0);
+  assert.equal(facts.secondsSinceMutation, 60);
+});
+
+test('a Codex apply-patch edit preserves the v0.6.6 post-mutation stall behavior', () => {
+  const lines = [
+    event('event_msg', { type: 'task_started' }, '2026-08-20T09:00:00Z'),
+    userLine('Fix the stale leaderboard row.', '2026-08-20T09:00:01Z'),
+    userLine('Stop investigating. Implement the smallest supported fix now.', '2026-08-20T09:02:00Z'),
+    codexApplyPatchLine('m1', '2026-08-20T09:05:00Z'),
+    ...investigationBurst(12, 'v', '2026-08-20T09:06:00Z'),
+  ];
+
+  const health = analyzeAgentHealth(lines, {
+    agent: { agentNickname: 'qwen' },
+    secondsSinceActivity: 30,
+    nowMs: Date.parse('2026-08-20T09:40:00Z'),
+  });
+
+  assert.equal(health.health, 'suspicious');
+  assert.ok(health.signals.some((signal) => signal.startsWith('post_mutation_stall:')));
+  assert.equal(health.progress.postMutationStall, true);
+  assert.equal(health.progress.currentTurnMutations, 1);
+  assert.equal(health.progress.investigationsSinceLatestMutation, 12);
+  // The worker did mutate after guidance. Misclassifying the edit would have
+  // reported this as a post-guidance stall instead, which is the replacement
+  // path rather than the watchdog's first-intervention path.
+  assert.equal(health.progress.postGuidanceStall, false);
+  assert.equal(health.progress.mutationsSinceGuidance, 1);
+  assert.equal(health.progress.preMutationStall, false);
+});
+
 test('prolonged investigation after the latest mutation is a post-mutation stall', () => {
   const lines = postMutationRolloutLines(12);
 

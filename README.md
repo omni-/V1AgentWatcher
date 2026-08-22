@@ -4,6 +4,8 @@ A small Codex plugin for supervising V1 child agents, especially local-model wor
 
 Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agents, but the parent does not get a useful live view of the child's intermediate progress. Codex already persists child activity under `~/.codex/sessions/.../rollout-*.jsonl`. V1 Agent Watcher exposes a compact view of that persisted activity back to the parent as MCP tools.
 
+Release notes: [CHANGELOG.md](CHANGELOG.md).
+
 ## Tools
 
 - `list_v1_agents` — list recent child rollout sessions and their thread/parent/provider metadata.
@@ -11,6 +13,7 @@ Codex V1 can spawn, wait for, interrupt, and send follow-up input to child agent
 - `inspect_v1_agent_health` — run a compact deterministic behavioral and progress screen for one exact V1 worker thread without returning its detailed trace.
 - `inspect_v1_agent` — inspect recent reasoning, assistant messages, and tool activity for a specific child.
 - `inspect_latest_v1_agent` — convenience tool for supervising the most recently active child, optionally filtered by cwd/provider.
+- `summarize_v1_worker_handoff` — build the compact structured completion handoff for one exact worker thread so the parent can answer without rereading the worker transcript.
 
 - `inspect_v1_agent_usage` - read lifetime accounting for one exact persisted thread, including root threads.
 - `inspect_v1_supervision_usage` - resolve an exact worker's parent and summarize the Sol benchmark turn, Luna lifetime, and worker lifetime separately.
@@ -28,7 +31,7 @@ A worker can stay technically active — still reasoning, still calling tools �
 3. no persisted repository-mutation call since — any patch/write/mutating-shell call resets the evidence;
 4. renewed rediscovery or replanning after the newest compaction instead of implementation.
 
-The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes. Compaction is read from every persisted spelling, including a top-level `{"type":"compacted"}` record as well as the `event_msg` payload variants.
+The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes. Mutation evidence is read from persisted tool calls, including Codex's own patch applier invoked as `& $codex --codex-run-as-apply-patch $patch` — the flag is hyphenated, so it is matched separately from the underscored `apply_patch` spelling. Compaction is read from every persisted spelling, including a top-level `{"type":"compacted"}` record as well as the `event_msg` payload variants.
 
 Two further stall signals catch the pattern that survives a tool-output token cap: a worker that diagnoses the task correctly, keeps planning and testing designs, and never edits the repository. Neither requires a compaction or an implementation-phase phrase.
 
@@ -40,9 +43,9 @@ Two further stall signals catch the pattern that survives a tool-output token ca
 
 Its thresholds come from Qwen benchmark traces, so only a Qwen worker escalates on it; for Ornith and unknown local workers the fact is reported without making the result suspicious.
 
-`post_guidance_stall` applies once the parent has already told the worker to implement, where action is expected quickly, and requires all of:
+`post_guidance_stall` applies once the worker has already been told to implement — by the watchdog or by the parent — where action is expected quickly, and requires all of:
 
-1. parent guidance occurred (a later user message that is not the delegated task, not a framework `<environment_context>` preamble, and not a compaction bridge summary);
+1. guidance occurred (a later user message that is not the delegated task, not a framework `<environment_context>` preamble, and not a compaction bridge summary);
 2. zero repository mutations since that guidance;
 3. at least 3 investigation/read/search calls since that guidance.
 
@@ -56,7 +59,7 @@ Any repository mutation clears the corresponding stall, and only the newest guid
 4. at least 10 investigation/read/search calls after that newest mutation;
 5. no later repository mutation.
 
-The newest mutation is the reset point, so a later edit restarts both the elapsed window and the count, and build/test commands are not investigation calls. Its thresholds are Qwen-calibrated too, so only a Qwen worker escalates on it. It reports `post_mutation_stall` and `investigations_since_latest_mutation` alongside the existing `seconds_since_mutation`, which already measures elapsed time from the newest mutation. Because earlier parent guidance may be why the mutation exists, a first `post_mutation_stall` is never treated as the worker ignoring guidance: Sol inspects once, sends one focused continuation telling the worker to preserve the implementation and stop expanding into validation infrastructure, and keeps the same worker. Only a `post_guidance_stall` against that newest continuation re-enters the existing replacement path.
+The newest mutation is the reset point, so a later edit restarts both the elapsed window and the count, and build/test commands are not investigation calls. Its thresholds are Qwen-calibrated too, so only a Qwen worker escalates on it. It reports `post_mutation_stall` and `investigations_since_latest_mutation` alongside the existing `seconds_since_mutation`, which already measures elapsed time from the newest mutation. Because earlier guidance may be why the mutation exists, a first `post_mutation_stall` is never treated as the worker ignoring guidance: Luna inspects once, sends one focused continuation telling the worker to preserve the implementation and stop expanding into validation infrastructure, and keeps the same worker without waking Sol. Only a `post_guidance_stall` against that newest continuation re-enters the existing replacement path, which is where Sol is involved.
 
 Each ingredient is deliberately insufficient alone: one compaction, one long inference, a clean worktree before implementation starts, and one huge tool result never escalate. Repeated compaction on its own no longer escalates either — a worker that edits between compactions is productive — so it is reported as a fact and escalates only alongside an independent signal.
 
@@ -64,23 +67,54 @@ Each ingredient is deliberately insufficient alone: one compaction, one long inf
 
 ## Cheap watchdog supervision
 
-The bundled supervision skill uses a persistent Luna sibling as the watchdog:
+The bundled supervision skill uses a persistent Luna sibling as the routine supervisor. Luna tokens are cheap and the local worker is free; the hosted parent is the expensive resource, so every routine observation of the worker belongs to Luna and the parent pays only for final judgement.
 
 ```text
 Sol
- ├─ Qwen: real engineering task
- └─ Luna: wait on Qwen, run compact health checks, stay silent while healthy
+ ├─ launches Qwen: real engineering task
+ ├─ launches Luna: routine supervisor
+ └─ waits on Luna and stays uninvolved
+        │
+        └─ Luna owns routine supervision
+             ├─ waits on Qwen
+             ├─ runs compact health checks at the fixed cadence
+             ├─ detects stalls and bad behavior
+             ├─ sends ordinary corrective guidance straight to Qwen
+             └─ escalates to Sol only when policy requires it
+
+Qwen finishes → Luna → compact structured handoff → Sol
 ```
+
+Once Qwen and Luna are running, the parent does not inspect the Qwen thread, poll its progress, read intermediate transcript, re-derive Luna's diagnosis, issue ordinary guidance, or check periodically whether the worker is still alive. Waiting on Luna is its whole supervision duty, and that wait consumes no worker context.
 
 Luna waits up to fifteen minutes between healthy Qwen checks (five minutes for Ornith and ten minutes for an unknown local worker), using the plugin's persisted-rollout wait so worker completion wakes it early even though Qwen is Luna's sibling. Each MCP wait call is capped at a transport-safe 225 seconds, and Luna composes a whole logical health window from those chunks inside ONE foreground Code Mode execution — a deterministic loop, not a background cell — so a fifteen-minute Qwen window costs one Luna inference rather than one per chunk. If the runtime rejects the full-window outer yield, the fallback is one 225-second chunk per execution inside a 240-second yield, leaving 15 seconds for MCP and wrapper completion.
 
-`wait_v1_agent` accepts optional `health_window_ms` / `elapsed_health_window_ms` / `found_in_health_window` arguments and returns the accumulated window state, so the inspection boundary is computed deterministically instead of being re-derived by the watchdog each turn. The accumulated state comes back as `health_window.elapsed_ms` and `health_window.found_in_window`, and — because the input argument names are easy to read back by mistake — the same values are also exposed as `health_window.elapsed_health_window_ms` and `health_window.found_in_health_window`. Reading either spelling carries the accumulator forward; a watchdog can no longer silently restart the logical window by resending zeroes. A completed chunk that observed the worker resets missing-worker state and contributes its elapsed time, but never triggers an inspection by itself; health is inspected exactly once per completed logical window. Tool, transport, and Code Mode yield failures contribute zero elapsed time and do not count as missing-worker windows. Luna returns only `DONE` or `NEEDS_SOL_REVIEW`.
+`wait_v1_agent` accepts optional `health_window_ms` / `elapsed_health_window_ms` / `found_in_health_window` arguments and returns the accumulated window state, so the inspection boundary is computed deterministically instead of being re-derived by the watchdog each turn. The accumulated state comes back as `health_window.elapsed_ms` and `health_window.found_in_window`, and — because the input argument names are easy to read back by mistake — the same values are also exposed as `health_window.elapsed_health_window_ms` and `health_window.found_in_health_window`. Reading either spelling carries the accumulator forward; a watchdog can no longer silently restart the logical window by resending zeroes. A completed chunk that observed the worker resets missing-worker state and contributes its elapsed time, but never triggers an inspection by itself; health is inspected exactly once per completed logical window. Tool, transport, and Code Mode yield failures contribute zero elapsed time and do not count as missing-worker windows. Luna returns `DONE` with the completion handoff, `NEEDS_SOL_REVIEW` for a genuine escalation, or `NEEDS_SOL_RELAY` when it has decided on ordinary guidance but cannot deliver it itself.
 
 Sol waits on Luna through the native one-hour `wait_agent`, with the enclosing Code Mode execution explicitly given the same one-hour yield. This keeps Sol dormant until Luna returns or the native wait genuinely expires. Healthy supervision never uses repeated background-cell `wait(cell_id)` calls; an unexpected background-cell yield is reported as a Code Mode runtime failure.
 
+### Completion handoff
+
+When the worker finishes, Luna calls `summarize_v1_worker_handoff` once and returns its JSON verbatim after the `DONE` line. The handoff is built deterministically from the persisted worker rollout, so the watchdog never reconstructs the run in prose and the summary cannot grow into a second transcript. It carries the worker status, the delegated task, the worker's own final message (where it states its result and root cause), the paths named by its persisted mutation calls, the build/test commands it ran with `passed`/`failed`/`unknown` outcomes, capped material warnings, the watchdog intervention record, and two decision fields:
+
+- `material_concern: false` with `parent_action: "use_handoff"` — nothing in the persisted run warrants parent inspection. Sol answers from the handoff and the worker's final result, and does not re-inspect the transcript or repository to reconfirm routine work.
+- `material_concern: true` with `parent_action: "review_concern"` — a non-clean terminal state, a persisted error, a failed verification, a suspicious health screen, or a concrete concern Luna stated. Sol inspects only what that concern requires.
+
+`verification_missing` and `no_mutation` are reported as facts and never make a handoff materially concerning on their own — a read-only task legitimately produces neither.
+
+Known limitation: the handoff reads the same tail-capped rollout window as the rest of the watcher (8 MiB by default). On a rollout larger than that window the earliest records fall outside it, so `task_summary` can resolve to a later message and the earliest `files_changed` entries can be missing. Streaming the whole rollout while retaining only the bounded facts is the eventual fix.
+
+### Watchdog intervention
+
+Ordinary corrective guidance is Luna's job. When the health screen reports `progress_stall`, `pre_mutation_stall`, or `post_mutation_stall`, Luna inspects one small detailed window and sends the matching fixed continuation to the same worker through `send_input` with `interrupt=false`, then resumes the same health-window cadence without waking Sol. The continuation texts are fixed so a cheap model never authors technical instruction; Luna sends at most one per stall class and at most two per run.
+
+Sol is woken only for cases that need stronger judgement: a `post_guidance_stall` against guidance that was already delivered (the replacement path), a worker still materially stuck after Luna's guidance, an ambiguous technical or design decision, a terminal/unreadable state, or an unrecoverable watchdog transport or Code Mode failure. Taking a long time or making one recoverable mistake is not an escalation.
+
+V1 documents no sibling-safe `send_input` the way this plugin deliberately provides a sibling-safe `wait_v1_agent`. If `send_input` to the worker is unavailable to a watchdog, Luna returns `NEEDS_SOL_RELAY` with the exact continuation text and Sol delivers it verbatim without inspecting the worker, then re-enters the same one-hour wait. That costs one small parent turn instead of the full inspect-diagnose-steer cycle, and Luna stays the sole routine observer of the worker.
+
 After escalation, inactivity alone is not grounds to abandon a worker. If detailed inspection still shows `running` with recent persisted activity, Sol keeps that worker unless there is an independent terminal, unreadable, error, or clear loop signal.
 
-A `progress_stall` escalation follows the same principle. On the first stall Sol inspects the detailed trace and, if it confirms an established diagnosis and concrete plan, sends one focused continuation to the same worker telling it to implement the smallest supported fix now rather than investigating further; the worker is not replaced. Sol also checks there whether the worker broadened past the original task after already finding a sufficient fix, and may tell it to defer adjacent architectural concerns. If the same worker stalls again after that explicit guidance — reported as `progress_stall_after_guidance`, or as `post_guidance_stall` when it simply resumed investigating without mutating anything — replacement becomes justified. None of this adds polling: progress analysis happens only at the existing health-window boundaries.
+A `progress_stall` follows the same principle. On the first stall Luna inspects the detailed trace and, if it confirms an established diagnosis and concrete plan, sends one focused continuation to the same worker telling it to implement the smallest supported fix now rather than investigating further; the worker is not replaced and Sol is not woken. Luna also checks there whether the worker broadened past the original task after already finding a sufficient fix, and may add one sentence telling it to defer adjacent architectural concerns. If the same worker stalls again after that explicit guidance — reported as `progress_stall_after_guidance`, or as `post_guidance_stall` when it simply resumed investigating without mutating anything — replacement becomes justified, and replacement is Sol's decision, so Luna escalates instead of guiding again. None of this adds polling: progress analysis happens only at the existing health-window boundaries.
 
 ### Worker role selection
 
@@ -214,8 +248,10 @@ Restart Codex after installation. The bundled stdio MCP server uses only Node.js
 ```text
 Delegate the implementation to the `qwen` agent, retain its exact thread ID,
 and use the supervise-v1-agent skill to spawn one Luna watchdog for that ID.
-Wait on Luna. Do not inspect Qwen's trace while Luna reports no terminal result.
-After Luna returns DONE, review Qwen's diff yourself.
+Luna owns routine supervision, including ordinary corrective guidance.
+Wait on Luna and do nothing else while it reports no terminal result.
+After Luna returns DONE with a clean handoff, answer from that handoff and
+Qwen's final result; only investigate further if the handoff names a concern.
 ```
 
 ## Requirements
@@ -233,4 +269,4 @@ npm test
 
 The MCP server is dependency-free and speaks newline-delimited JSON-RPC over stdio.
 
-The Code Mode execution wrapper is implemented upstream in Codex rather than in this repository. Focused skill tests therefore lock the required generated invocation contract (one-hour parent yield, the composed Luna window loop with 225-second MCP chunks, one health inspection per completed logical window, no healthy background-cell polling, the first-stall/repeated-stall parent policy, and local-worker reasoning omission), while the server tests lock the MCP timeout and health-window schema.
+The Code Mode execution wrapper is implemented upstream in Codex rather than in this repository. Focused skill tests therefore lock the required generated invocation contract (one-hour parent yield, the composed Luna window loop with 225-second MCP chunks, one health inspection per completed logical window, no healthy background-cell polling, watchdog-owned first-stall intervention, the repeated-stall escalation to the parent, the parent non-participation and clean-handoff rules, the relay fallback, and local-worker reasoning omission), while the server tests lock the MCP timeout, health-window, and handoff schema. `test/handoff.test.mjs` locks the deterministic handoff itself.

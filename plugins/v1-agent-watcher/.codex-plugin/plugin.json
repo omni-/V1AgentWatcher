@@ -1,7 +1,7 @@
 {
   "name": "v1-agent-watcher",
-  "version": "0.6.7",
-  "description": "Supervise Codex V1 child agents and inspect exact post-hoc rollout token usage.",
+  "version": "0.7.0",
+  "description": "Delegate routine supervision of Codex V1 child agents to a cheap watchdog and inspect exact post-hoc rollout token usage.",
   "author": {
     "name": "omni-"
   },
@@ -13,11 +13,11 @@
   "interface": {
     "displayName": "V1 Agent Watcher",
     "shortDescription": "V1 supervision and rollout usage",
-    "longDescription": "Screens persisted V1 child-agent rollouts for observable loops and stalls, provides a persistent Luna-watchdog supervision workflow, and reports exact-thread post-hoc token accounting for benchmarks.",
+    "longDescription": "Screens persisted V1 child-agent rollouts for observable loops and stalls, runs a persistent Luna watchdog that supervises and corrects the worker directly so the expensive parent stays dormant until a compact structured completion handoff arrives, and reports exact-thread post-hoc token accounting for benchmarks.",
     "developerName": "omni-",
     "category": "Developer Tools",
     "capabilities": ["Interactive", "Read"],
     "websiteURL": "https://github.com/omni-/V1AgentWatcher",
-    "defaultPrompt": ["Supervise my running V1 worker cheaply with a persistent Luna watchdog."]
+    "defaultPrompt": ["Supervise my running V1 worker with a Luna watchdog that handles routine correction itself."]
   }
 }

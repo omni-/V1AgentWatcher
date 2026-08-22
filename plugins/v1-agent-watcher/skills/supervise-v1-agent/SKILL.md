@@ -1,11 +1,13 @@
 ---
 name: supervise-v1-agent
-description: Supervise a running Codex V1 child agent cheaply with a persistent Luna watchdog, deterministic rollout health checks, long waits, and queued steering only when parent attention is warranted.
+description: Delegate routine supervision of a running Codex V1 child agent to a cheap persistent Luna watchdog that guides the worker directly, and keep the expensive parent dormant until a compact structured completion handoff or a genuine escalation arrives.
 ---
 
 # Supervise V1 Agent
 
-Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent should not wake on every healthy cadence boundary and must not re-solve or independently review the worker's engineering task while the worker is running.
+Use a persistent `gpt-5.6-luna` sibling as the routine supervisor. The parent starts the worker and the watchdog, then stays out of the run. It must not wake on healthy cadence boundaries, must not re-solve or independently review the worker's engineering task while the worker is running, and must not perform the routine supervision the watchdog already owns.
+
+Luna tokens are cheap and the worker is local; the parent's tokens are the expensive resource. Every routine observation of the worker therefore belongs to Luna, and the parent pays only for the final judgement.
 
 ## Required architecture
 
@@ -27,15 +29,44 @@ Use a persistent `gpt-5.6-luna` sibling as the progress watchdog. The parent sho
    ```
 
    The native wait returns early when the watchdog finishes, while the matching outer yield keeps Code Mode attached instead of creating a background cell after its short default. If that native one-hour wait genuinely times out without a terminal watchdog result, immediately repeat the same complete Code Mode invocation, including the first-line yield pragma. Between healthy outer waits, do not inspect the worker or watchdog, emit progress commentary, summarize status, or perform any other parent work.
-4. The watchdog stays silent while the worker is healthy. It returns only when the worker completes or observable behavior warrants parent attention.
-5. After `DONE`, the parent reviews the worker's final changes normally. After `NEEDS_SOL_REVIEW`, the parent may call `inspect_v1_agent` for a small detailed window and decide whether queued guidance is needed. A worker that is still `running` with recent persisted activity must be preserved unless inspection also shows an independent concrete terminal, error, unreadable, or repeated-loop signal.
+4. Luna owns routine supervision for the whole run: it waits on the worker, runs the deterministic health screen at the cadence below, diagnoses the observable stall signals, and sends ordinary corrective guidance to the worker itself. The watchdog stays silent while the worker is healthy and returns only when the worker completes or when something genuinely requires the parent.
+5. On completion, Luna returns `DONE` plus one compact structured handoff produced by `summarize_v1_worker_handoff`. On a genuine escalation it returns `NEEDS_SOL_REVIEW` or `NEEDS_SOL_RELAY`. See "Watchdog terminal results" and "Parent responsibilities" below.
 6. Retain the exact worker and watchdog thread IDs in the final report so the human can measure the completed run afterward with `v1usage -Worker <worker-id> -Watchdog <watchdog-id>`.
 
-After the watchdog is spawned, the parent must remain silent until the watchdog returns `DONE` or `NEEDS_SOL_REVIEW`, the user provides new input, the native one-hour wait genuinely expires, or an actual tool/runtime error requires parent action. A healthy `wait_agent` timeout is not a progress update; re-enter the same explicit one-hour wait immediately.
+After the watchdog is spawned, the parent must remain silent until the watchdog returns a terminal line, the user provides new input, the native one-hour wait genuinely expires, or an actual tool/runtime error requires parent action. A healthy `wait_agent` timeout is not a progress update; re-enter the same explicit one-hour wait immediately.
 
 A healthy long wait must never degrade into model-authored background-cell polling. Repeated `wait(cell_id)` calls are not a normal or acceptable supervision path. If Code Mode rejects the explicit 3600000 ms outer yield because the active runtime advertises a lower maximum, or unexpectedly returns `Script running with cell ID ...` before the native wait has completed, treat that as a Code Mode runtime failure: report it clearly and stop the supervision attempt instead of polling the cell. The active runtime must support and accept the one-hour outer yield for this workflow.
 
 Always address the worker by exact `thread_id`. A watchdog is itself a child rollout and may be newer than the worker, so latest-session selection is unsafe after the watchdog has been spawned.
+
+## Parent responsibilities
+
+While the worker is running, the parent must NOT:
+
+- inspect the Qwen thread or read intermediate worker transcript
+- poll Qwen progress or periodically check whether the worker is still alive
+- duplicate Luna's diagnosis or re-derive the health signals itself
+- issue ordinary corrective guidance
+- emit progress commentary or interim summaries
+
+Luna performs every one of those jobs. Waiting on the watchdog is the parent's whole supervision duty, and waiting must never consume worker context.
+
+### Trust a clean handoff
+
+If the watchdog reports successful completion with no material concern, use its handoff and the worker's final result to answer the user. Do not independently re-inspect the worker transcript or repository merely to reconfirm routine work.
+
+The handoff's `parent_action` field states this outcome deterministically:
+
+- `use_handoff` — nothing in the persisted run warrants parent inspection. Answer from `result_summary`, `files_changed`, and `verification`.
+- `review_concern` — the handoff carries at least one material warning. Inspect only what is needed to resolve that specific concern, and nothing else.
+
+A `warnings` entry is a reason to look at one thing, not a reason to replay the run. `verification_missing` and `no_mutation` are reported facts and do not by themselves make a handoff materially concerning.
+
+### Parent escalation work
+
+`NEEDS_SOL_REVIEW` is the parent's cue to apply stronger-model judgement. Only then may the parent call `inspect_v1_agent` for a small detailed window and decide on replacement, interruption, or its own steering. See "Repeated progress stall after guidance". A worker that is still `running` with recent persisted activity must be preserved unless inspection also shows an independent concrete terminal, error, unreadable, or repeated-loop signal.
+
+`NEEDS_SOL_RELAY` is not a review request. Luna has already decided on ordinary guidance but could not deliver it; the parent sends the quoted text verbatim to the worker through `send_input` with `interrupt=false`, does not inspect the worker, and immediately re-enters the same one-hour watchdog wait.
 
 ## Worker role selection
 
@@ -80,12 +111,33 @@ v1usage -Worker <exact-worker-thread-id> -Watchdog <exact-watchdog-thread-id>
 
 Do not call the accounting MCP operation automatically at the end of supervision. A Sol MCP call requires another Sol inference turn and changes the quantity being measured. The post-hoc CLI reads the finished Sol/Qwen/Luna rollout tree without that observer effect. Keep accounting out of the healthy Luna wait loop.
 
+## Watchdog terminal results
+
+Luna returns exactly one of three terminal shapes, and nothing else:
+
+```text
+DONE: worker completed
+<the summarize_v1_worker_handoff JSON, verbatim>
+```
+
+```text
+NEEDS_SOL_REVIEW: <one concise sentence describing the observable state>
+```
+
+```text
+NEEDS_SOL_RELAY: <the exact guidance text Luna wants delivered to the worker>
+```
+
+`DONE` is the normal ending. `NEEDS_SOL_REVIEW` is reserved for the exceptional cases listed in the watchdog contract. `NEEDS_SOL_RELAY` exists only because sending input to a sibling thread may be outside a watchdog's V1 ownership; see "Sibling guidance delivery".
+
 ## Watchdog prompt
 
 Give Luna the following contract, substituting the worker ID, kind, provider, and cwd. Include the health-window accumulator mapping and its two assignment lines verbatim; do not paraphrase them as “track `elapsed_health_window_ms` and `found_in_health_window` via the fields the tool returns”, which invites Luna to assume the returned fields carry the input argument names:
 
 ```text
-You are a V1 subagent-progress watchdog.
+You are the routine supervisor for a V1 subagent. You own normal supervision of
+this worker. The parent is dormant and expensive; wake it only for the
+exceptional cases listed below.
 
 Worker thread: <exact-thread-id>
 Worker kind: <qwen|ornith|unknown>
@@ -95,11 +147,13 @@ Observed rollout cwd (informational): <cwd if known>
 Do not solve, diagnose, or review the worker's engineering task.
 Do not inspect the repository or open source files.
 Do not evaluate whether the worker's technical theory or implementation is correct.
-Do not propose fixes or send guidance to the worker.
+Do not judge which fix is correct or propose a design.
 Use only:
 1. `wait_v1_agent` targeting the exact worker thread. This plugin operation follows persisted rollout state and is safe for sibling workers; do not use native Codex `wait_agent` from Luna.
 2. inspect_v1_agent_health targeting that same exact thread, without provider/cwd filters.
-Do not call inspect_v1_agent unless the parent later asks you to do so.
+3. inspect_v1_agent, ONLY once immediately before an intervention permitted below, for one small detailed window.
+4. `send_input` with `interrupt=false` targeting that exact thread, ONLY to deliver one of the fixed continuation texts below.
+5. `summarize_v1_worker_handoff`, exactly once, when the worker has completed.
 
 Loop internally:
 - Use a logical health window of 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker.
@@ -165,8 +219,7 @@ Loop internally:
 
   Every individual MCP wait stays at or below 225000 ms, so no single request exceeds the transport-safe limit. The loop never calls `wait(cell_id)` and never creates a background cell. A `completed` or `terminal_error` chunk breaks out immediately, so worker completion still wakes the watchdog early. If the runtime rejects the full-window outer yield, fall back to exactly one 225000 ms chunk per Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin, and carry `elapsed_health_window_ms` and `found_in_health_window` across your own turns using the assignment above. The inspection cadence below is identical either way.
 - Do not call `wait(cell_id)` to finish an otherwise healthy MCP chunk. An unexpected Code Mode background-cell yield is an enclosing runtime failure, not a completed MCP timeout and not evidence about worker health; return `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` instead of polling that cell.
-- If `wait_v1_agent` reports `completed`, return exactly:
-  DONE: worker completed
+- If `wait_v1_agent` reports `completed`, produce the completion handoff described under "Completion handoff" and return `DONE`.
 - If `wait_v1_agent` reports `terminal_error`, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence describing that observable state>
 - Only a returned `outcome: timeout` is a completed wait chunk, and only a completed chunk contributes its actual `waitedMs` to the current logical health window. A tool exception, MCP failure, transport timeout, or Code Mode yield failure contributes ZERO elapsed health-window time, says nothing about worker presence or health, and must never increment the missing-worker count.
@@ -175,25 +228,49 @@ Loop internally:
 - After that inspection, reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false, then begin another complete window.
 - `health_window.missing_window` true means a full window completed with every chunk reporting `found=false`. Count one full missing window, reset the window accumulators, and do not inspect. Escalate only after three consecutive full missing windows.
 - Retry a failed transport chunk. If three consecutive transport/tool failures prevent observation, return `NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts`; do not describe the worker as missing or unhealthy.
-- If state is idle/completed, return exactly:
-  DONE: worker completed
+- If state is idle/completed, produce the completion handoff and return `DONE`.
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
 - Check the stall signals in this order and return on the first match: `post_guidance_stall`, then `post_mutation_stall`, then `progress_stall`/`pre_mutation_stall`, then any other suspicious state. A worker that stalls after guidance usually raises the earlier signals too, so checking `post_guidance_stall` first is what keeps the repeated-stall case distinguishable from the first stall, and `post_mutation_stall` must be recognized before the first-stall branch because a worker that already mutated is in a different state from one that never did.
-- If health is suspicious and its signals include `post_guidance_stall`, return exactly:
+- If health is suspicious and its signals include `post_guidance_stall`, the worker has ignored guidance that was already delivered. Do not send more guidance. Return exactly:
   NEEDS_SOL_REVIEW: worker resumed investigating after parent guidance without mutating the repository
-- Otherwise, if health is suspicious and its signals include `post_mutation_stall`, return exactly:
-  NEEDS_SOL_REVIEW: worker changed the repository but has spent too long investigating without further mutation
-- Otherwise, if health is suspicious and its signals include `progress_stall` or `pre_mutation_stall`, return exactly:
-  NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation
+- Otherwise, if health is suspicious and its signals include `post_mutation_stall`, intervene yourself using the post-mutation continuation below, then resume this loop. Do not wake the parent for it.
+- Otherwise, if health is suspicious and its signals include `progress_stall` or `pre_mutation_stall`, intervene yourself using the first-stall continuation below, then resume this loop. Do not wake the parent for it.
 - If health is otherwise suspicious, unreadable, aborted, or errored, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence copied or summarized only from the observable health signal>
 - Provider and cwd values are diagnostic context, not identity constraints. Persisted cwd can reflect the parent launch context even when the worker correctly changed its shell cwd.
 - A single self-correction is normal. Qwen producing no new persisted output for up to one hour can still be normal model inference and is not suspicious by itself. A single compaction, a long inference, a clean worktree, and one large tool result are each normal on their own; only the deterministic stall signals combine them.
-- Keep the normal health-window cadence. `pre_mutation_stall` and `post_guidance_stall` are deterministic enough that the first scheduled inspection catches them; do not shorten the window or add extra polling to find them sooner.
+- Keep the normal health-window cadence. `pre_mutation_stall` and `post_guidance_stall` are deterministic enough that the first scheduled inspection catches them; do not shorten the window or add extra polling to find them sooner. Intervening does not change the cadence either: after sending a continuation, begin another full health window.
 - If health inspection itself cannot inspect the exact thread, wait another full health window before retrying. Escalate only after three such full-window inspection failures, and describe the inspection failure rather than claiming the worker is unhealthy.
+
+Intervention limits:
+- Send at most one continuation per stall class, and at most two continuations in the whole run.
+- The continuation texts below are fixed. Send one verbatim. You may append at most one sentence of scope guidance where the section below explicitly permits it. Never author your own technical instruction, diagnosis, or fix.
+- If a third intervention would be needed, return instead:
+  NEEDS_SOL_REVIEW: worker remains materially stuck after watchdog guidance
+- Any ambiguous technical or design decision belongs to the parent. Return:
+  NEEDS_SOL_REVIEW: <one concise sentence naming the decision the parent must make>
+
+Completion handoff:
+- Call `summarize_v1_worker_handoff` exactly once, with the exact worker thread id, `watchdog_interventions` set to the number of continuations you sent, `watchdog_note` set to one short sentence only if you intervened, and `watchdog_concern` set only if you have a concrete remaining concern for the parent.
+- Return the line `DONE: worker completed` followed by that tool's JSON result verbatim.
+- Add nothing else. Never include a chronological account, reasoning trace, long command output, worker transcript, or your own engineering assessment.
 
 Do not emit periodic progress updates. Continue until one terminal line above can be returned.
 ```
+
+## Sibling guidance delivery
+
+Luna reaches the worker through V1 `send_input` with `interrupt=false`, addressing the exact worker `thread_id`. V1 does not document sibling `send_input` as ownership-free the way this plugin's `wait_v1_agent` is deliberately sibling-safe, so the delivery path can be unavailable to a watchdog.
+
+If `send_input` to the worker is rejected as unavailable or out of scope, Luna must not retry, must not inspect further, and must not improvise. It returns:
+
+```text
+NEEDS_SOL_RELAY: <the exact continuation text, verbatim>
+```
+
+The parent then delivers exactly that text through `send_input` with `interrupt=false` and re-enters the same one-hour watchdog wait without inspecting the worker. This costs the parent one small turn instead of the full inspect-diagnose-steer cycle, and it keeps Luna the sole routine observer of the worker.
+
+Do not use `interrupt=true` for normal supervision. In V1 it aborts the active child turn and can leave external-provider workers stopped. Reserve interruption for intentional cancellation. If a worker must be abandoned, close it and spawn a replacement with the corrected premise in its initial task. That decision belongs to the parent.
 
 ## Deterministic health screen
 
@@ -209,7 +286,7 @@ Activity age comes from the newest parseable persisted `event_msg` or `response_
 
 1. the worker committed to an implementation phase (an explicit implementation plan or an explicit statement that it is now applying the change);
 2. at least two context compactions occurred after that commitment;
-3. no persisted repository-mutation call occurred since — mutation evidence is any persisted patch/write/mutating-shell call, and any such call resets all of this evidence;
+3. no persisted repository-mutation call occurred since — mutation evidence is any persisted patch/write/mutating-shell call, including Codex's own applier invoked as `& $codex --codex-run-as-apply-patch $patch`, and any such call resets all of this evidence;
 4. after the newest compaction the worker returned to repository rediscovery (three or more read/search calls) or reconstructed the implementation plan again instead of implementing.
 
 The health result also reports the supporting facts: `compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, and `progress_stall_after_guidance`.
@@ -230,9 +307,9 @@ Any repository mutation in the current turn clears it. Command classification no
 
 ### post_guidance_stall
 
-`post_guidance_stall` applies once the parent has already told the worker to implement. It also requires no compaction:
+`post_guidance_stall` applies once the worker has already been told to implement, whether that guidance came from the watchdog or from the parent. It also requires no compaction:
 
-1. parent guidance occurred (a later user message that is not the delegated task, not a framework `<environment_context>` preamble, and not a compaction bridge summary);
+1. guidance occurred (a later user message that is not the delegated task, not a framework `<environment_context>` preamble, and not a compaction bridge summary);
 2. zero repository mutations since that guidance;
 3. at least 3 investigation/read/search calls since that guidance.
 
@@ -256,15 +333,15 @@ One compaction, one long inference, a clean worktree before implementation begin
 
 `large_tool_output` is reported as a low-severity explanatory fact and never escalates by itself. It counts tool results above roughly 20000 tokens, sized from structured token metadata first, then from the pre-truncation count Codex writes into the output body (`Original token count: 80219`), and only then from a character estimate — the persisted body is truncated, so its stored length understates a pathological result.
 
-## Steering after escalation
+## Watchdog intervention
 
-If the parent determines that ordinary technical guidance is needed, send one concise correction through V1 `send_input` with `interrupt=false`, or omit the flag only when omission means queued input. Prefer a factual constraint or concrete next action.
+Ordinary corrective guidance is the watchdog's job, not the parent's. Luna sends one concise correction through V1 `send_input` with `interrupt=false`, or omits the flag only when omission means queued input. The continuation texts are fixed so a cheap model never has to author technical instruction.
 
 ### First progress stall: continue the same worker
 
-A `progress_stall` escalation never justifies killing a live worker by itself. Recent persisted activity still means the worker is alive; suspicion is a reason for parent review, not automatic abandonment.
+A `progress_stall` escalation never justifies killing a live worker by itself. Recent persisted activity still means the worker is alive; suspicion is a reason for a narrow correction, not automatic abandonment.
 
-On the first `progress_stall` or `pre_mutation_stall` escalation:
+On the first `progress_stall` or `pre_mutation_stall`:
 
 1. Call `inspect_v1_agent` once for a small detailed window.
 2. If that trace confirms the diagnosis is already established, the implementation plan is concrete, and the worker has repeatedly compacted, replanned, or simply kept investigating without mutating the repository, send ONE focused continuation to the SAME worker through `send_input` with `interrupt=false`:
@@ -275,13 +352,13 @@ On the first `progress_stall` or `pre_mutation_stall` escalation:
    Do not broaden scope unless implementation evidence requires it.
    ```
 
-3. Resume the same worker and the same Luna supervision loop. Do not replace the worker and do not spawn a second worker.
+3. Resume the same worker and the same health-window loop. Do not replace the worker and do not spawn a second worker, and do not wake the parent for this.
 
-While reviewing that trace, also check whether the worker expanded past the originally requested task after it had already identified a sufficient fix. If it did, the continuation may add one sentence telling it to implement the smallest fix supported by the original task and to defer adjacent architectural concerns unless correctness requires them. This is a scope instruction from the parent, not a code review by the watchdog; Luna never judges which fix is correct.
+While reviewing that trace, also check whether the worker expanded past the originally requested task after it had already identified a sufficient fix. If it did, the continuation may add one sentence telling it to implement the smallest fix supported by the original task and to defer adjacent architectural concerns unless correctness requires them. This is a scope instruction, not a code review; the watchdog never judges which fix is correct.
 
 ### First post-mutation stall: continue the same worker
 
-A `post_mutation_stall` is not the repeated-stall case, even when the parent has already sent guidance earlier in the run. Earlier guidance may be exactly why the mutation exists: the worker was told to implement, and it did. A later post-mutation stall therefore does not mean the worker ignored parent guidance, and it does not enter the replacement path.
+A `post_mutation_stall` is not the repeated-stall case, even when guidance has already been sent earlier in the run. Earlier guidance may be exactly why the mutation exists: the worker was told to implement, and it did. A later post-mutation stall therefore does not mean the worker ignored that guidance, and it does not enter the replacement path.
 
 On the first `post_mutation_stall`:
 
@@ -295,19 +372,36 @@ On the first `post_mutation_stall`:
    Do not refactor production code or add new infrastructure solely to make validation easier unless the original task requires it.
    ```
 
-3. Resume the same worker and the same Luna supervision loop. Do not replace the worker and do not spawn a second worker.
+3. Resume the same worker and the same health-window loop. Do not replace the worker and do not spawn a second worker, and do not wake the parent for this.
 
-If the worker then trips `post_guidance_stall` against THIS newest continuation — at least three read/search calls and zero mutations since it — the existing replacement policy applies normally. In other words, first guidance -> mutation -> `post_mutation_stall` does not justify replacement, while `post_mutation_stall` -> focused continuation -> `post_guidance_stall` may.
+If the worker then trips `post_guidance_stall` against THIS newest continuation — at least three read/search calls and zero mutations since it — the existing replacement policy applies normally, and that is the point at which the parent is woken. In other words, first guidance -> mutation -> `post_mutation_stall` does not justify replacement, while `post_mutation_stall` -> focused continuation -> `post_guidance_stall` may.
 
 ### Repeated progress stall after guidance
 
-If the same worker stalls again after that explicit implementation guidance — another compaction/replanning cycle with no mutation, reported as `progress_stall_after_guidance: true`, or renewed investigation with no mutation since the guidance, reported as `post_guidance_stall: true` — replacement becomes justified. Close that worker and spawn a replacement whose initial task carries the established diagnosis, the implementation plan, and an explicit instruction to implement before investigating further.
+If the same worker stalls again after that explicit implementation guidance — another compaction/replanning cycle with no mutation, reported as `progress_stall_after_guidance: true`, or renewed investigation with no mutation since the guidance, reported as `post_guidance_stall: true` — replacement becomes justified, and replacement is a parent decision. The watchdog stops guiding and returns `NEEDS_SOL_REVIEW`.
+
+The parent then closes that worker and spawns a replacement whose initial task carries the established diagnosis, the implementation plan, and an explicit instruction to implement before investigating further.
 
 Do not add progress polling to detect any of this. Progress analysis happens only at the existing logical health-window boundaries or when the worker emits a terminal or suspicious state.
 
 An inactivity-only or watchdog-transport escalation is a request to inspect, not permission to abandon the worker. If detailed inspection shows `state: running` and recent persisted activity below the applicable inactivity threshold, keep the existing worker. Replace or interrupt only when there is separate concrete evidence such as a terminal abort/error, an unreadable rollout that prevents safe supervision, or a clear repeated loop/failure pattern. Do not weaken those terminal and loop cases.
 
-Do not use `interrupt=true` for normal supervision. In V1 it aborts the active child turn and can leave external-provider workers stopped. Reserve interruption for intentional cancellation. If a worker must be abandoned, close it and spawn a replacement with the corrected premise in its initial task.
+## Completion handoff
+
+`summarize_v1_worker_handoff` builds the parent-facing summary deterministically from the persisted worker rollout, so the watchdog never reconstructs the run in prose and the handoff cannot grow into a second transcript. It returns:
+
+- `worker_thread_id`, `worker_status`
+- `task_summary` — the delegated task, truncated
+- `result_summary` — the worker's own final message, truncated. This is where the worker states its result and its root cause; the handoff forwards it rather than re-deriving it.
+- `files_changed` — the paths named by persisted repository-mutation calls
+- `verification` / `verification_performed` — persisted build/test commands with `passed`, `failed`, or `unknown` outcomes
+- `warnings` — material warnings, capped
+- `watchdog` — whether Luna intervened, how many times, and one short reason when materially relevant
+- `material_concern` and `parent_action`
+
+A clean run therefore arrives at the parent as `material_concern: false` and `parent_action: "use_handoff"`, which is the explicit signal that no independent re-investigation is warranted.
+
+The handoff reads the same tail-capped rollout window as the rest of the watcher. On a rollout larger than that window the earliest records fall outside it, so `task_summary` can resolve to a later message and the earliest `files_changed` entries can be missing.
 
 ## Graceful fallback
 
@@ -315,4 +409,4 @@ Plugins currently distribute this workflow as a skill plus MCP server; they do n
 
 That model-only spawn is specific to the watchdog, whose whole contract is the prompt in this skill. Do not generalize it to the worker: role configuration such as `model_provider` lives in the registered agent definition and not in the model name, so a Qwen worker must be spawned as the `qwen` agent type. See "Worker role selection".
 
-The sibling-safe `wait_v1_agent` MCP operation is part of this plugin and is required for the Luna architecture. If it is unavailable, report the missing plugin capability rather than substituting native sibling `wait_agent`, which is ownership-scoped and may be unavailable to Luna. If `gpt-5.6-luna` itself is unavailable, the parent may perform the same persisted-rollout wait/compact-health loop while preserving the model-specific cadence and three-attempt startup grace.
+The sibling-safe `wait_v1_agent` MCP operation is part of this plugin and is required for the Luna architecture. If it is unavailable, report the missing plugin capability rather than substituting native sibling `wait_agent`, which is ownership-scoped and may be unavailable to Luna. If `summarize_v1_worker_handoff` is unavailable, Luna returns `DONE: worker completed` with the worker's final message and nothing else; the parent may then inspect once. If `gpt-5.6-luna` itself is unavailable, the parent may perform the same persisted-rollout wait/compact-health loop while preserving the model-specific cadence and three-attempt startup grace.
