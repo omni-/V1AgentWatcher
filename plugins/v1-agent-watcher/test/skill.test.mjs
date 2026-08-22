@@ -6,19 +6,83 @@ import { fileURLToPath } from 'node:url';
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-test('supervision contract keeps parent and Luna waits inside foreground Code Mode executions', async () => {
+test('the parent keeps its one-hour wait inside one foreground Code Mode execution', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 
   assert.match(skill, /native V1 `wait_agent`[\s\S]*`timeout_ms=3600000`/);
   assert.match(skill, /\/\/ @exec: \{"yield_time_ms": 3600000\}[\s\S]*tools\.multi_agent_v1__wait_agent\([\s\S]*timeout_ms: 3600000/);
+  assert.match(skill, /Repeated `wait\(cell_id\)` calls are not a normal or acceptable supervision path/);
+  assert.match(skill, /still `running` with recent persisted activity must be preserved/);
+});
+
+test('v0.7.1: Luna runs one wait chunk per Code Mode execution and composes the window across turns', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
   assert.match(skill, /`wait_v1_agent` chunks of at most 225000 ms/);
-  assert.match(skill, /\/\/ @exec: \{"yield_time_ms": 960000\}[\s\S]*tools\.mcp__v1_agent_watcher__wait_v1_agent\([\s\S]*Math\.min\(225000, healthWindowMs - elapsedMs\)/);
+  assert.match(skill, /Run exactly ONE `wait_v1_agent` chunk per Code Mode execution/);
+  assert.match(skill, /compose the logical window across as many executions and model turns as it takes/);
+  assert.match(skill, /\/\/ @exec: \{"yield_time_ms": 240000\}[\s\S]*tools\.mcp__v1_agent_watcher__wait_v1_agent\([\s\S]*timeout_ms: 225000/);
   assert.match(skill, /deliberate 15000 ms completion margin/);
   assert.match(skill, /900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker/);
-  assert.match(skill, /Repeated `wait\(cell_id\)` calls are not a normal or acceptable supervision path/);
-  assert.match(skill, /unexpected Code Mode background-cell yield is an enclosing runtime failure/);
   assert.match(skill, /Code Mode yield failure contributes ZERO elapsed health-window time/);
-  assert.match(skill, /still `running` with recent persisted activity must be preserved/);
+
+  // v0.7.0 required one execution to stay attached for the whole logical
+  // window. That assumption is what broke at the first Qwen boundary.
+  assert.equal(/Compose the whole logical window inside ONE foreground Code Mode execution/.test(skill), false);
+  assert.equal(/yield_time_ms": 960000/.test(skill), false);
+  assert.match(skill, /Do not try to hold one execution attached for the whole logical window/);
+  assert.match(skill, /needing four executions to compose a 900000 ms Qwen window is the normal, expected path/);
+});
+
+test('v0.7.1: an ordinary Luna execution boundary is continuation, never a watchdog failure', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /A Code Mode execution ending between chunks is ordinary continuation, not failure/);
+  assert.match(skill, /it never justifies a `NEEDS_SOL_REVIEW` by itself/);
+  assert.match(skill, /Carrying the logical window across your own turns is the normal supervision path, not a fallback/);
+
+  // The v0.7.0 terminal line that fired on a normal execution boundary is gone
+  // in every form, so it cannot be returned merely because a turn ended.
+  assert.equal(/could not remain attached/.test(skill), false);
+  assert.equal(/unexpected Code Mode background-cell yield is an enclosing runtime failure/.test(skill), false);
+
+  // A genuinely lost chunk is still handled, and still only through the
+  // existing three-attempt transport limit.
+  assert.match(skill, /Start a fresh single-chunk execution with the accumulator values unchanged, and count that lost chunk toward the same three-attempt limit as a transport failure/);
+  assert.match(skill, /Do not call `wait\(cell_id\)`/);
+});
+
+test('v0.7.1: Luna never ends its agent turn between chunks, so the parent stays asleep', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /Never end your agent turn between chunks/);
+  assert.match(skill, /any message you finish on ends your turn and wakes it/);
+  assert.match(skill, /Only the terminal lines below may end your turn/);
+  // The parent contract must say the same thing from its own side.
+  assert.match(skill, /Luna never finishes a message between chunks, so its agent turn does not end and the parent's single native wait does not return/);
+  assert.match(skill, /- wake, poll, prompt, or otherwise participate because Luna needed another turn to finish composing a health window/);
+  assert.match(skill, /the parent stays in the same native one-hour wait until Luna returns `DONE`, `NEEDS_SOL_REVIEW`, or `NEEDS_SOL_RELAY`/);
+});
+
+test('v0.7.1: accumulator state is carried as literals because Code Mode scope does not survive', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /Every Code Mode execution starts with a fresh scope, so no JavaScript variable survives from one chunk to the next/);
+  assert.match(skill, /Write the carried values in as literals, copied from the previous chunk's `health_window\.next_wait_args`/);
+  assert.match(skill, /The accumulator lives in the arguments you send and the fields the tool returns, never in a live execution/);
+  // The second-chunk example must actually carry non-zero accumulator state.
+  assert.match(skill, /elapsed_health_window_ms: 225000,\s*\n\s*found_in_health_window: true/);
+  assert.match(skill, /the carried `elapsed_health_window_ms`, `found_in_health_window`, and `missing_health_windows`/);
+});
+
+test('v0.7.1: next_action drives the boundary instead of watchdog arithmetic', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /`health_window\.next_action` names the one thing to do before the next chunk/);
+  assert.match(skill, /`continue_window` — the window is still accumulating\. Send the next chunk immediately and do nothing else\./);
+  assert.match(skill, /`inspect_health` — this chunk completed the logical window and the worker was observed\. Run exactly one `inspect_v1_agent_health`/);
+  assert.match(skill, /`note_missing_window` — the window completed without any chunk observing the worker\. Do not inspect/);
+  assert.match(skill, /only once `health_window\.missing_health_windows` reaches 3/);
 });
 
 test('the health-window contract inspects once per completed logical window', async () => {
@@ -28,7 +92,8 @@ test('the health-window contract inspects once per completed logical window', as
   assert.match(skill, /Never call inspect_v1_agent_health merely because a chunk returned/);
   assert.match(skill, /exactly once per completed logical health window/);
   assert.match(skill, /four completed 225000 ms chunks produce one inspection at 900000 ms, not four inspections/);
-  assert.match(skill, /reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false/);
+  // v0.7.1: the boundary reset is delivered by the tool, not performed by hand.
+  assert.match(skill, /already carries the reset — `elapsed_health_window_ms: 0` and `found_in_health_window: false`/);
   // The window boundary is computed by the tool, not by watchdog arithmetic.
   assert.match(skill, /health_window\.inspect_now/);
   assert.match(skill, /health_window\.missing_window/);
@@ -183,21 +248,43 @@ test('a first post-mutation stall keeps the same worker and only a later post-gu
   assert.equal(/blazor|bunit|razor/i.test(section), false);
 });
 
-test('the contract separates health-window input argument names from returned field names', async () => {
+test('v0.7.1: next_wait_args is the only prescribed source of continuation arguments', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 
-  assert.match(skill, /elapsed_health_window_ms\s+<-\s+health_window\.elapsed_ms/);
-  assert.match(skill, /found_in_health_window\s+<-\s+health_window\.found_in_window/);
-  assert.match(skill, /`elapsed_health_window_ms` and `found_in_health_window` are input argument\s+names/);
-  // The parent prompt must carry the assignment itself, not a paraphrase that
-  // lets Luna infer the returned fields use the input argument names.
-  assert.match(skill, /elapsed_health_window_ms = result\.health_window\.elapsed_ms/);
-  assert.match(skill, /found_in_health_window\s+= result\.health_window\.found_in_window/);
-  assert.match(skill, /Include the health-window accumulator mapping and its two assignment lines verbatim/);
-  assert.match(skill, /Never re-send\s+`elapsed_health_window_ms: 0` after a completed chunk/);
-  // The canonical loop keeps reading the canonical fields.
-  assert.match(skill, /elapsedMs = last\.health_window\.elapsed_ms;/);
-  assert.match(skill, /foundInWindow = last\.health_window\.found_in_window;/);
+  assert.match(skill, /For the next wait call, copy `health_window\.next_wait_args` exactly\. That is\s+the only source of continuation arguments\./);
+  assert.match(skill, /`next_wait_args` already contains the post-boundary reset/);
+  assert.match(skill, /The `next_wait_args` returned by the boundary chunk already carries the reset/);
+  assert.match(skill, /Include the `next_wait_args` continuation rule and its diagnostics-only list verbatim/);
+
+  // The v0.6.5 reconstruction recipe is equivalent to next_wait_args inside an
+  // incomplete window and WRONG at a boundary, where next_wait_args has already
+  // reset. Following it after the fourth Qwen chunk starts the next window at
+  // 900000/true, so the very next chunk looks like another completed window and
+  // health is inspected every chunk instead of every 15 minutes.
+  assert.equal(/elapsed_health_window_ms = result\.health_window\.elapsed_ms/.test(skill), false);
+  assert.equal(/found_in_health_window\s+= result\.health_window\.found_in_window/.test(skill), false);
+  assert.equal(/elapsed_health_window_ms\s+<-\s+health_window\.elapsed_ms/.test(skill), false);
+  assert.equal(/found_in_health_window\s+<-\s+health_window\.found_in_window/.test(skill), false);
+  assert.equal(/After each completed timeout, assign exactly/.test(skill), false);
+  // This line was itself inverted at a boundary, where 0 is the correct value.
+  assert.equal(/Never re-send\s+`elapsed_health_window_ms: 0` after a completed chunk/.test(skill), false);
+});
+
+test('v0.7.1: the raw accumulator fields are labelled diagnostics, not next-call values', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /Do not reconstruct continuation arguments from `health_window\.elapsed_ms` or\s+`health_window\.found_in_window`/);
+  assert.match(skill, /at a logical-window boundary they intentionally differ from the\s+already-reset values in `next_wait_args`/);
+  assert.match(skill, /NEXT CALL\s+<-\s+health_window\.next_wait_args\s+\(always, verbatim\)/);
+  assert.match(skill, /DIAGNOSTICS ONLY\s+<-\s+health_window\.elapsed_ms/);
+  assert.match(skill, /The diagnostic fields are safe to read and to report\. They are never\s+next-call values\./);
+
+  // The concrete boundary case must be spelled out, since that is the only
+  // place the two recipes disagree.
+  assert.match(skill, /On the fourth Qwen chunk the result reads `elapsed_ms: 900000` and\s+`found_in_window: true`/);
+  assert.match(skill, /`next_wait_args` correctly reads `elapsed_health_window_ms: 0` and\s+`found_in_health_window: false`/);
+  assert.match(skill, /you would inspect health every chunk instead\s+of every 15 minutes/);
+  assert.match(skill, /do not carry the completed window's `elapsed_ms` into the new one/);
 });
 
 test('the parent delegates routine supervision and never polls the worker', async () => {
@@ -260,7 +347,7 @@ test('escalation stays available for exceptional cases only', async () => {
   assert.match(skill, /NEEDS_SOL_REVIEW: worker remains materially stuck after watchdog guidance/);
   assert.match(skill, /NEEDS_SOL_REVIEW: <one concise sentence naming the decision the parent must make>/);
   assert.match(skill, /NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts/);
-  assert.match(skill, /NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached/);
+  // v0.7.1 removed the foreground-attachment escalation entirely.
   // Replacement remains a parent decision after guidance was already ignored.
   assert.match(skill, /replacement becomes justified, and replacement is a parent decision/);
   assert.match(skill, /The parent then closes that worker and spawns a replacement/);

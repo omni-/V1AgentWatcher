@@ -680,6 +680,275 @@ test('failed transport chunks contribute zero accumulated health-window time', (
   assert.equal(unreported.inspectNow, false);
 });
 
+// --- v0.7.1: one logical window composed across separate watchdog turns ---
+//
+// v0.7.0 required a single foreground Code Mode execution to stay attached for
+// the whole 900000 ms Qwen window, and the real runtime ended that execution at
+// the first boundary. These tests model the supported shape instead: one wait
+// chunk per turn, with nothing crossing the boundary except the arguments the
+// tool told the watchdog to send back.
+
+const QWEN_WINDOW_MS = 900000;
+
+function firstChunkArgs(threadId = 'qwen-thread', windowMs = QWEN_WINDOW_MS) {
+  return {
+    thread_id: threadId,
+    timeout_ms: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
+    health_window_ms: windowMs,
+    elapsed_health_window_ms: 0,
+    found_in_health_window: false,
+    missing_health_windows: 0,
+  };
+}
+
+/**
+ * One watchdog turn: exactly one wait chunk, then the turn ends. Only `args` —
+ * the literal argument object the watchdog carried forward — survives.
+ */
+function watchdogTurn(args, chunk) {
+  return formatHealthWindow(
+    accumulateHealthWindow({
+      windowMs: args.health_window_ms,
+      elapsedMs: args.elapsed_health_window_ms,
+      foundInWindow: args.found_in_health_window,
+      missingWindows: args.missing_health_windows,
+      outcome: chunk.outcome,
+      waitedMs: chunk.waitedMs,
+      found: chunk.found,
+    }),
+    { threadId: args.thread_id },
+  );
+}
+
+/**
+ * The watchdog contract itself, driven one turn at a time. A transport failure
+ * throws before any result exists, so the carried arguments are simply resent.
+ */
+function superviseAcrossTurns(chunks, options = {}) {
+  const trace = { inspections: 0, missingWindowsNoted: 0, chunksAwaited: 0, escalations: [], terminal: null, handoffs: 0 };
+  let args = firstChunkArgs(options.threadId, options.windowMs);
+  let consecutiveFailures = 0;
+
+  for (const chunk of chunks) {
+    trace.chunksAwaited += 1;
+
+    if (chunk.outcome === 'transport_failure') {
+      // Nothing observed, nothing returned: resend the same accumulator.
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= 3) {
+        trace.escalations.push('NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts');
+        trace.terminal = 'NEEDS_SOL_REVIEW';
+        break;
+      }
+      continue;
+    }
+
+    const window = watchdogTurn(args, chunk);
+    consecutiveFailures = 0;
+
+    if (chunk.outcome === 'completed') {
+      trace.handoffs += 1;
+      trace.terminal = 'DONE';
+      break;
+    }
+    if (chunk.outcome === 'terminal_error') {
+      trace.escalations.push('NEEDS_SOL_REVIEW: worker reached a terminal state');
+      trace.terminal = 'NEEDS_SOL_REVIEW';
+      break;
+    }
+
+    if (window.next_action === 'inspect_health') trace.inspections += 1;
+    if (window.next_action === 'note_missing_window') {
+      trace.missingWindowsNoted += 1;
+      if (window.missing_health_windows >= 3) {
+        trace.escalations.push('NEEDS_SOL_REVIEW: worker not observed for three consecutive windows');
+        trace.terminal = 'NEEDS_SOL_REVIEW';
+        break;
+      }
+    }
+    trace.carried = window;
+    args = window.next_wait_args;
+  }
+
+  trace.finalArgs = args;
+  return trace;
+}
+
+function healthyChunk() {
+  return { outcome: 'timeout', waitedMs: TRANSPORT_SAFE_WAIT_TIMEOUT_MS, found: true };
+}
+
+function unseenChunk() {
+  return { outcome: 'timeout', waitedMs: TRANSPORT_SAFE_WAIT_TIMEOUT_MS, found: false };
+}
+
+test('v0.7.1: a 900000 ms Qwen window composed from four separate turns inspects exactly once', () => {
+  const trace = superviseAcrossTurns([healthyChunk(), healthyChunk(), healthyChunk(), healthyChunk()]);
+
+  assert.equal(trace.inspections, 1);
+  assert.equal(trace.chunksAwaited, 4);
+  assert.equal(trace.escalations.length, 0);
+  assert.equal(trace.terminal, null);
+  assert.equal(trace.carried.elapsed_ms, QWEN_WINDOW_MS);
+  assert.equal(trace.carried.next_action, 'inspect_health');
+  // The boundary chunk hands back an already-reset window for the next one.
+  assert.equal(trace.finalArgs.elapsed_health_window_ms, 0);
+  assert.equal(trace.finalArgs.found_in_health_window, false);
+  assert.equal(trace.finalArgs.health_window_ms, QWEN_WINDOW_MS);
+  assert.equal(trace.finalArgs.thread_id, 'qwen-thread');
+});
+
+test('v0.7.1: the accumulator survives turn boundaries because it lives in the returned arguments', () => {
+  const observed = [];
+  let args = firstChunkArgs();
+  for (let turn = 0; turn < 4; turn += 1) {
+    const window = watchdogTurn(args, healthyChunk());
+    observed.push({ elapsed: window.elapsed_ms, action: window.next_action });
+    // Nothing but next_wait_args crosses into the following turn.
+    args = window.next_wait_args;
+  }
+
+  assert.deepEqual(observed, [
+    { elapsed: 225000, action: 'continue_window' },
+    { elapsed: 450000, action: 'continue_window' },
+    { elapsed: 675000, action: 'continue_window' },
+    { elapsed: 900000, action: 'inspect_health' },
+  ]);
+});
+
+test('v0.7.1: an intermediate healthy chunk neither inspects early nor escalates', () => {
+  for (const chunkCount of [1, 2, 3]) {
+    const trace = superviseAcrossTurns(Array.from({ length: chunkCount }, healthyChunk));
+
+    assert.equal(trace.inspections, 0);
+    assert.equal(trace.escalations.length, 0);
+    assert.equal(trace.terminal, null);
+    assert.equal(trace.carried.next_action, 'continue_window');
+    assert.equal(trace.carried.inspect_now, false);
+    assert.equal(trace.carried.missing_window, false);
+    // Accumulator state is preserved rather than restarted.
+    assert.equal(trace.finalArgs.elapsed_health_window_ms, chunkCount * 225000);
+    assert.equal(trace.finalArgs.found_in_health_window, true);
+    assert.equal(trace.finalArgs.timeout_ms, TRANSPORT_SAFE_WAIT_TIMEOUT_MS);
+  }
+});
+
+test('v0.7.1: worker completion in any later chunk ends supervision immediately', () => {
+  for (const completingChunk of [2, 3, 4]) {
+    const chunks = Array.from({ length: completingChunk - 1 }, healthyChunk);
+    chunks.push({ outcome: 'completed', waitedMs: 40000, found: true });
+    // Chunks that must never be awaited once the worker has completed.
+    chunks.push(healthyChunk(), healthyChunk());
+
+    const trace = superviseAcrossTurns(chunks);
+
+    assert.equal(trace.terminal, 'DONE');
+    assert.equal(trace.handoffs, 1);
+    assert.equal(trace.inspections, 0);
+    assert.equal(trace.escalations.length, 0);
+    assert.equal(trace.chunksAwaited, completingChunk);
+  }
+});
+
+test('v0.7.1: only a fully completed unseen window increments the missing-window count', () => {
+  let args = firstChunkArgs();
+  const counts = [];
+  for (let turn = 0; turn < 4; turn += 1) {
+    const window = watchdogTurn(args, unseenChunk());
+    counts.push({ missing: window.missing_health_windows, action: window.next_action });
+    args = window.next_wait_args;
+  }
+
+  assert.deepEqual(counts, [
+    { missing: 0, action: 'continue_window' },
+    { missing: 0, action: 'continue_window' },
+    { missing: 0, action: 'continue_window' },
+    { missing: 1, action: 'note_missing_window' },
+  ]);
+  assert.equal(args.missing_health_windows, 1);
+  assert.equal(args.elapsed_health_window_ms, 0);
+});
+
+test('v0.7.1: three consecutive unseen windows escalate, and a sighting clears the count', () => {
+  const twelveUnseen = Array.from({ length: 12 }, unseenChunk);
+  const escalated = superviseAcrossTurns(twelveUnseen);
+
+  assert.equal(escalated.missingWindowsNoted, 3);
+  assert.equal(escalated.inspections, 0);
+  assert.deepEqual(escalated.escalations, ['NEEDS_SOL_REVIEW: worker not observed for three consecutive windows']);
+
+  // A single sighting anywhere in the next window clears the accumulated
+  // missing-worker evidence, exactly as within one execution.
+  let args = { ...firstChunkArgs(), missing_health_windows: 2 };
+  const seen = watchdogTurn(args, healthyChunk());
+  assert.equal(seen.missing_health_windows, 0);
+  assert.equal(seen.next_wait_args.missing_health_windows, 0);
+});
+
+test('v0.7.1: a transport failure between healthy chunks costs zero time and corrupts nothing', () => {
+  const trace = superviseAcrossTurns([
+    healthyChunk(),
+    { outcome: 'transport_failure' },
+    healthyChunk(),
+    { outcome: 'transport_failure' },
+    healthyChunk(),
+    healthyChunk(),
+  ]);
+
+  // Four healthy chunks still complete exactly one logical window.
+  assert.equal(trace.inspections, 1);
+  assert.equal(trace.escalations.length, 0);
+  assert.equal(trace.terminal, null);
+  assert.equal(trace.carried.elapsed_ms, QWEN_WINDOW_MS);
+
+  // A completed chunk clears the consecutive-failure count even across turns.
+  const stillHealthy = superviseAcrossTurns([
+    { outcome: 'transport_failure' },
+    { outcome: 'transport_failure' },
+    healthyChunk(),
+    { outcome: 'transport_failure' },
+    { outcome: 'transport_failure' },
+    healthyChunk(),
+  ]);
+  assert.equal(stillHealthy.escalations.length, 0);
+  assert.equal(stillHealthy.finalArgs.elapsed_health_window_ms, 450000);
+
+  const exhausted = superviseAcrossTurns([
+    healthyChunk(),
+    { outcome: 'transport_failure' },
+    { outcome: 'transport_failure' },
+    { outcome: 'transport_failure' },
+  ]);
+  assert.deepEqual(exhausted.escalations, ['NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts']);
+});
+
+test('v0.7.1: crossing a turn boundary never escalates by itself', () => {
+  // Sixteen chunks is four full logical windows spread over sixteen turns.
+  const trace = superviseAcrossTurns(Array.from({ length: 16 }, healthyChunk));
+
+  assert.equal(trace.escalations.length, 0);
+  assert.equal(trace.terminal, null);
+  assert.equal(trace.inspections, 4);
+  assert.equal(trace.missingWindowsNoted, 0);
+});
+
+test('v0.7.1: the inspection cadence stays at one per logical window for every worker kind', () => {
+  for (const [windowMs, expectedChunks] of [[900000, 4], [600000, 3], [300000, 2]]) {
+    let args = firstChunkArgs('worker-thread', windowMs);
+    let chunks = 0;
+    let inspections = 0;
+    while (inspections === 0) {
+      const window = watchdogTurn(args, { outcome: 'timeout', waitedMs: Math.min(TRANSPORT_SAFE_WAIT_TIMEOUT_MS, args.timeout_ms), found: true });
+      chunks += 1;
+      if (window.next_action === 'inspect_health') inspections += 1;
+      args = window.next_wait_args;
+      assert.ok(chunks <= 10, 'the window must terminate');
+    }
+    assert.equal(inspections, 1);
+    assert.equal(chunks, expectedChunks);
+  }
+});
+
 test('progress stall is reported after two compactions and replanning without mutation', () => {
   const health = analyzeAgentHealth(stalledRolloutLines(), {
     agent: { agentNickname: 'qwen' },
