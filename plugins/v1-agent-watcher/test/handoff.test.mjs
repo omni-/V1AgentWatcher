@@ -224,3 +224,61 @@ test('an unknown worker thread yields no handoff rather than a guess', async (t)
 
   assert.equal(await summarizeWorkerHandoff({ codexHome: root, threadId: 'absent' }), null);
 });
+
+// The literal edit mechanism from Qwen's developer prompt: Codex persists the
+// whole PowerShell script, so the patch body travels with the command.
+function codexApplyPatchCommand(file) {
+  return [
+    "$patch = @'",
+    '*** Begin Patch',
+    `*** Update File: ${file}`,
+    '@@',
+    '-        _rows = rows;',
+    '+        if (token != _currentToken) return;',
+    '*** End Patch',
+    "'@",
+    '& $codex --codex-run-as-apply-patch $patch',
+  ].join('\n');
+}
+
+test("the Codex apply-patch invocation Qwen actually uses names its file in the handoff", async (t) => {
+  const root = await temporaryCodexHome(t);
+  await makeRollout(root, 'rollout-worker.jsonl', qwenMeta(), [
+    event('task_started', {}),
+    userMessage('Fix the stale leaderboard row.'),
+    event('exec_command_begin', { call_id: 'm1', command: ['pwsh', '-Command', codexApplyPatchCommand('src/LeaderboardService.cs')] }),
+    event('exec_command_end', { call_id: 'm1', exit_code: 0 }),
+    event('exec_command_begin', { call_id: 'v1', command: ['dotnet', 'test'] }),
+    event('exec_command_end', { call_id: 'v1', exit_code: 0 }),
+    assistantMessage('Root cause: the leaderboard callback applied a stale response. Guarded on the request token; dotnet test passes.'),
+    event('task_complete', {}),
+  ]);
+
+  const handoff = await summarizeWorkerHandoff({ codexHome: root, threadId: 'worker' });
+
+  // Regression: the flag is hyphenated, so the underscored 'apply_patch'
+  // spelling never matched it. A successful real Qwen run then reported an
+  // empty files_changed and a spurious no_mutation warning.
+  assert.deepEqual(handoff.files_changed, ['src/LeaderboardService.cs']);
+  assert.deepEqual(handoff.verification, [{ command: 'dotnet test', outcome: 'passed' }]);
+  assert.deepEqual(handoff.warnings, []);
+  assert.equal(handoff.material_concern, false);
+  assert.equal(handoff.parent_action, 'use_handoff');
+});
+
+test('a Codex apply-patch edit is a mutation, not an investigation call', () => {
+  const facts = collectHandoffFacts([
+    JSON.stringify(event('task_started', {})),
+    JSON.stringify(event('exec_command_begin', {
+      call_id: 'm1',
+      command: ['pwsh', '-Command', codexApplyPatchCommand('src/loader.mjs')],
+    })),
+    JSON.stringify(event('exec_command_end', { call_id: 'm1', exit_code: 0 })),
+    JSON.stringify(event('task_complete', {})),
+  ]);
+
+  assert.equal(facts.mutationCalls, 1);
+  assert.deepEqual(facts.filesChanged, ['src/loader.mjs']);
+  // The patch body is never mistaken for a build/test command.
+  assert.deepEqual(facts.verification, []);
+});

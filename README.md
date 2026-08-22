@@ -31,7 +31,7 @@ A worker can stay technically active — still reasoning, still calling tools �
 3. no persisted repository-mutation call since — any patch/write/mutating-shell call resets the evidence;
 4. renewed rediscovery or replanning after the newest compaction instead of implementation.
 
-The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes. Compaction is read from every persisted spelling, including a top-level `{"type":"compacted"}` record as well as the `event_msg` payload variants.
+The health result reports the supporting facts (`compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, `progress_stall_after_guidance`). Mutation evidence comes from persisted tool calls, so the watchdog never inspects the repository or the worker's source changes. Mutation evidence is read from persisted tool calls, including Codex's own patch applier invoked as `& $codex --codex-run-as-apply-patch $patch` — the flag is hyphenated, so it is matched separately from the underscored `apply_patch` spelling. Compaction is read from every persisted spelling, including a top-level `{"type":"compacted"}` record as well as the `event_msg` payload variants.
 
 Two further stall signals catch the pattern that survives a tool-output token cap: a worker that diagnoses the task correctly, keeps planning and testing designs, and never edits the repository. Neither requires a compaction or an implementation-phase phrase.
 
@@ -101,6 +101,8 @@ When the worker finishes, Luna calls `summarize_v1_worker_handoff` once and retu
 - `material_concern: true` with `parent_action: "review_concern"` — a non-clean terminal state, a persisted error, a failed verification, a suspicious health screen, or a concrete concern Luna stated. Sol inspects only what that concern requires.
 
 `verification_missing` and `no_mutation` are reported as facts and never make a handoff materially concerning on their own — a read-only task legitimately produces neither.
+
+Known limitation: the handoff reads the same tail-capped rollout window as the rest of the watcher (8 MiB by default). On a rollout larger than that window the earliest records fall outside it, so `task_summary` can resolve to a later message and the earliest `files_changed` entries can be missing. Streaming the whole rollout while retaining only the bounded facts is the eventual fix.
 
 ### Watchdog intervention
 

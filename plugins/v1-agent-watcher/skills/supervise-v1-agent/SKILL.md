@@ -286,7 +286,7 @@ Activity age comes from the newest parseable persisted `event_msg` or `response_
 
 1. the worker committed to an implementation phase (an explicit implementation plan or an explicit statement that it is now applying the change);
 2. at least two context compactions occurred after that commitment;
-3. no persisted repository-mutation call occurred since — mutation evidence is any persisted patch/write/mutating-shell call, and any such call resets all of this evidence;
+3. no persisted repository-mutation call occurred since — mutation evidence is any persisted patch/write/mutating-shell call, including Codex's own applier invoked as `& $codex --codex-run-as-apply-patch $patch`, and any such call resets all of this evidence;
 4. after the newest compaction the worker returned to repository rediscovery (three or more read/search calls) or reconstructed the implementation plan again instead of implementing.
 
 The health result also reports the supporting facts: `compactions_since_mutation`, `seconds_since_mutation`, `implementation_phase_committed`, `implementation_phase_reentered`, `post_compaction_rediscovery`, and `progress_stall_after_guidance`.
@@ -400,6 +400,8 @@ An inactivity-only or watchdog-transport escalation is a request to inspect, not
 - `material_concern` and `parent_action`
 
 A clean run therefore arrives at the parent as `material_concern: false` and `parent_action: "use_handoff"`, which is the explicit signal that no independent re-investigation is warranted.
+
+The handoff reads the same tail-capped rollout window as the rest of the watcher. On a rollout larger than that window the earliest records fall outside it, so `task_summary` can resolve to a later message and the earliest `files_changed` entries can be missing.
 
 ## Graceful fallback
 

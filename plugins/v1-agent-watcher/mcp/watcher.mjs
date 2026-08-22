@@ -771,6 +771,12 @@ const INVESTIGATION_COMMAND_PATTERN = /^(?:rg|grep|egrep|find|fd|ls|dir|tree|gci
 // missed mutation could produce a false stall.
 const MUTATION_COMMAND_PATTERNS = [
   /\b(?:apply_patch|applypatch|write_file|edit_file|create_file|str_replace|update_file|patch_file|set-content|add-content|out-file|new-item|tee|sed\s+-i|git\s+(?:apply|add|commit|mv|rm|restore|checkout\s+-b))\b/i,
+  // Codex's own patch applier, which the worker invokes as
+  // `& $codex --codex-run-as-apply-patch $patch`. The flag is hyphenated, so the
+  // underscored `apply_patch` spelling above never matches it, and the real Qwen
+  // edit path would otherwise persist as a non-mutation: no files_changed, a
+  // spurious no_mutation warning, and a post_mutation_stall that can never fire.
+  /\bcodex-run-as-apply-patch\b/i,
   /\s1?>>?\s*[a-z0-9_.\\/-]+/i,
 ];
 

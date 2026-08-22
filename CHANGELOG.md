@@ -18,7 +18,11 @@ The parent's supervision cost was structural, not incidental: it woke on every e
 
 **V1 API limitation.** V1 documents no sibling-safe `send_input` the way this plugin deliberately provides a sibling-safe `wait_v1_agent`, and there is no way to asynchronously wake a genuinely dormant parent. The closest clean design is implemented: the parent blocks on the watchdog result rather than supervising the worker, and if `send_input` to the worker is unavailable to a watchdog, Luna returns the new `NEEDS_SOL_RELAY` terminal line with the exact continuation text. The parent delivers it verbatim without inspecting the worker and re-enters the same wait — one small parent turn instead of the full inspect-diagnose-steer cycle, with Luna still the sole routine observer.
 
+**Recognize Codex's own patch applier.** Qwen edits through `& $codex --codex-run-as-apply-patch $patch`. The flag is hyphenated, so the underscored `apply_patch` spelling never matched it and every real Qwen edit persisted as a non-mutation: an empty `files_changed`, a spurious `no_mutation` warning, and a `post_mutation_stall` that could never fire. Mutation classification now matches the hyphenated flag, and the existing patch-body path extraction reads the changed file straight out of the persisted script.
+
 Preserved unchanged: the v0.6.6 post-mutation-stall thresholds and its "first stall keeps the same worker" rule, every stall-signal threshold and the signal check order, the health-window cadence and accumulator contract, the registered-`qwen`-role requirement and its fail-fast behavior, the refusal to fall back to a generic `worker` spawn with a model override, mutation safety, and `interrupt=false` for all non-cancellation steering.
+
+Known limitation: the handoff reads the same tail-capped rollout window as the rest of the watcher (8 MiB by default), so on a rollout larger than that window `task_summary` can resolve to a later message and the earliest `files_changed` entries can be missing.
 
 No token reduction is claimed here; it has not been benchmarked. The change removes the structural sources of duplicated parent supervision.
 
