@@ -1412,24 +1412,47 @@ export function normalizeWaitTimeoutMs(value, maximum = TRANSPORT_SAFE_WAIT_TIME
  * wait chunks. Only a completed `timeout` chunk contributes elapsed time, and a
  * chunk that observed the worker never triggers an inspection by itself: health
  * inspection happens exactly once per completed logical window.
+ *
+ * The accumulator is deliberately stateless. Every fact it needs arrives as an
+ * argument and every fact the caller needs to continue comes back in the
+ * result, so one logical window can be composed from chunks that ran in
+ * different watchdog turns. Nothing here assumes the chunks shared a process,
+ * a Code Mode execution, or a single model turn.
  */
 export function accumulateHealthWindow(options = {}) {
   const windowMs = clampInt(options.windowMs, 1, 24 * 60 * 60 * 1000, TRANSPORT_SAFE_WAIT_TIMEOUT_MS);
   const previousElapsedMs = clampInt(options.elapsedMs, 0, 24 * 60 * 60 * 1000, 0);
+  const previousMissingWindows = clampInt(options.missingWindows, 0, 1000, 0);
   const contributedMs = options.outcome === 'timeout'
     ? clampInt(options.waitedMs, 0, 24 * 60 * 60 * 1000, 0)
     : 0;
   const elapsedMs = previousElapsedMs + contributedMs;
   const foundInWindow = Boolean(options.foundInWindow) || (options.outcome === 'timeout' && Boolean(options.found));
   const remainingMs = Math.max(0, windowMs - elapsedMs);
+  const windowComplete = elapsedMs >= windowMs;
+  const inspectNow = windowComplete && foundInWindow;
+  const missingWindow = windowComplete && !foundInWindow;
+  // Seeing the worker at all is immediate evidence against the missing-worker
+  // theory, so it clears the count. Only a window that completed without a
+  // single sighting increments it.
+  const missingWindows = missingWindow
+    ? previousMissingWindows + 1
+    : (foundInWindow ? 0 : previousMissingWindows);
   return {
     windowMs,
     elapsedMs,
     remainingMs,
     nextChunkMs: Math.min(TRANSPORT_SAFE_WAIT_TIMEOUT_MS, remainingMs > 0 ? remainingMs : windowMs),
     foundInWindow,
-    inspectNow: elapsedMs >= windowMs && foundInWindow,
-    missingWindow: elapsedMs >= windowMs && !foundInWindow,
+    inspectNow,
+    missingWindow,
+    windowComplete,
+    missingWindows,
+    // The accumulator resets only at a completed window, and the reset values
+    // are published rather than left to watchdog arithmetic.
+    nextElapsedMs: windowComplete ? 0 : elapsedMs,
+    nextFoundInWindow: windowComplete ? false : foundInWindow,
+    nextAction: inspectNow ? 'inspect_health' : (missingWindow ? 'note_missing_window' : 'continue_window'),
   };
 }
 
@@ -1441,8 +1464,22 @@ export function accumulateHealthWindow(options = {}) {
  * exact values under the tool's input-argument names, so a watchdog that reads
  * back the names it sent still carries real accumulator state into the next
  * chunk instead of silently restarting the logical window every time.
+ *
+ * `next_wait_args` is the whole point of the cross-turn design: it is a
+ * ready-to-send argument object for the following chunk, already carrying the
+ * post-boundary reset. A watchdog that resumes in a later turn copies it
+ * forward verbatim instead of reconstructing elapsed time from memory.
  */
-export function formatHealthWindow(window) {
+export function formatHealthWindow(window, options = {}) {
+  const nextWaitArgs = {
+    ...(options.threadId ? { thread_id: options.threadId } : {}),
+    timeout_ms: window.nextChunkMs,
+    health_window_ms: window.windowMs,
+    elapsed_health_window_ms: window.nextElapsedMs,
+    found_in_health_window: window.nextFoundInWindow,
+    missing_health_windows: window.missingWindows,
+  };
+
   return {
     window_ms: window.windowMs,
     elapsed_ms: window.elapsedMs,
@@ -1451,8 +1488,13 @@ export function formatHealthWindow(window) {
     found_in_window: window.foundInWindow,
     inspect_now: window.inspectNow,
     missing_window: window.missingWindow,
+    window_complete: window.windowComplete,
+    missing_windows: window.missingWindows,
+    next_action: window.nextAction,
     elapsed_health_window_ms: window.elapsedMs,
     found_in_health_window: window.foundInWindow,
+    missing_health_windows: window.missingWindows,
+    next_wait_args: nextWaitArgs,
   };
 }
 

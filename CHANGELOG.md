@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.1
+
+Reliability fix for the v0.7.0 supervision architecture: let Luna compose a long logical health window across its own ordinary turns instead of requiring one long-lived Code Mode execution.
+
+v0.7.0 moved routine supervision from Sol to Luna and that part worked. What did not work was how Luna was told to wait. The contract required the whole 900000 ms Qwen health window to be composed inside ONE foreground Code Mode execution holding a 960000 ms outer yield, so the four transport-safe wait chunks were loop iterations inside a single tool call. The real Codex runtime does not guarantee an execution stays attached that long, and it ended the execution at roughly the first health-window boundary. The contract treated that as an enclosing runtime failure, so the run died on `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` after about fifteen minutes of healthy supervision.
+
+**Chunked supervision is the normal path.** Luna now runs exactly one `wait_v1_agent` chunk per Code Mode execution inside a 240000 ms outer yield, and composes the logical window across as many executions and model turns as it takes. A 900000 ms Qwen window is four ordinary Luna turns. No execution has to survive longer than one 225000 ms chunk. The inspection cadence is unchanged: one `inspect_v1_agent_health` per completed logical window, still 900000 ms for Qwen, 300000 ms for Ornith, and 600000 ms for an unknown local worker.
+
+**A turn boundary is not a failure.** The `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` terminal line is removed. An execution ending between chunks is ordinary continuation: it costs no elapsed health-window time, counts toward no failure limit, and never escalates by itself. A chunk genuinely lost to a background-cell yield still observes nothing, still contributes zero elapsed time, still never counts as a missing worker, and is retried under the same existing three-attempt transport limit.
+
+**Accumulator state crosses turns in the arguments.** The health-window accumulator was already stateless, so this needed no redesign — only the state that used to live in JavaScript loop variables had to move into it. `wait_v1_agent` now also accepts and returns `missing_health_windows`, and every windowed result carries `health_window.next_wait_args`: a complete, ready-to-send argument object with the exact `thread_id`, the next `timeout_ms`, the same `health_window_ms`, and the carried accumulator, already reset when the chunk completed a window. `health_window.next_action` names the one thing to do before the next chunk — `continue_window`, `inspect_health`, or `note_missing_window` — so the boundary is never watchdog arithmetic. `elapsed_ms` / `found_in_window`, their `elapsed_health_window_ms` / `found_in_health_window` aliases, `inspect_now`, and `missing_window` are all unchanged.
+
+**Sol stays exactly as dormant as in v0.7.0.** The parent still enters one native `wait_agent` on the watchdog with a matching one-hour Code Mode yield and does nothing else. Luna's chunking is invisible to it because Luna never finishes a message between chunks: its agent turn does not end, so the parent's wait does not return. The contract states this from both sides — Luna may only end its turn on `DONE`, `NEEDS_SOL_REVIEW`, or `NEEDS_SOL_RELAY`, and the parent must not wake, poll, or participate because Luna needed another turn.
+
+Preserved unchanged: Luna-owned routine supervision, the compact deterministic completion handoff and `parent_action: use_handoff`, Luna's direct intervention for `progress_stall`, `pre_mutation_stall`, and `post_mutation_stall`, the v0.6.6 post-mutation-stall behavior, exceptional Sol escalation and the `NEEDS_SOL_RELAY` fallback, the intervention limits, the registered `qwen` role requirement with no generic worker fallback, the Qwen developer prompt, every health threshold and the signal check order, `interrupt=false` for ordinary guidance, and the 225000 ms transport-safe wait cap.
+
+No token savings are claimed. Luna now spends roughly four inferences per Qwen health window instead of one, and the v0.7.0 measurement of Luna's own usage looked cache-dominated rather than reasoning-dominated; both need separate benchmarking. The economic target of v0.7.0 — Sol below the direct-Sol baseline — is structurally untouched.
+
 ## 0.7.0
 
 Move routine supervision off the expensive parent and onto the cheap watchdog.

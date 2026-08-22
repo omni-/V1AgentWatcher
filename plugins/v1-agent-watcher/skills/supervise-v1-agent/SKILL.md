@@ -30,6 +30,8 @@ Luna tokens are cheap and the worker is local; the parent's tokens are the expen
 
    The native wait returns early when the watchdog finishes, while the matching outer yield keeps Code Mode attached instead of creating a background cell after its short default. If that native one-hour wait genuinely times out without a terminal watchdog result, immediately repeat the same complete Code Mode invocation, including the first-line yield pragma. Between healthy outer waits, do not inspect the worker or watchdog, emit progress commentary, summarize status, or perform any other parent work.
 4. Luna owns routine supervision for the whole run: it waits on the worker, runs the deterministic health screen at the cadence below, diagnoses the observable stall signals, and sends ordinary corrective guidance to the worker itself. The watchdog stays silent while the worker is healthy and returns only when the worker completes or when something genuinely requires the parent.
+
+   Luna composes each logical health window from several transport-safe wait chunks, and those chunks run across several of Luna's own Code Mode executions and model turns. That is normal and is invisible to the parent: Luna never finishes a message between chunks, so its agent turn does not end and the parent's single native wait does not return. The parent must not treat Luna's internal chunking as something to observe, poll, drive, or reason about, and must not shorten its own wait because of it.
 5. On completion, Luna returns `DONE` plus one compact structured handoff produced by `summarize_v1_worker_handoff`. On a genuine escalation it returns `NEEDS_SOL_REVIEW` or `NEEDS_SOL_RELAY`. See "Watchdog terminal results" and "Parent responsibilities" below.
 6. Retain the exact worker and watchdog thread IDs in the final report so the human can measure the completed run afterward with `v1usage -Worker <worker-id> -Watchdog <watchdog-id>`.
 
@@ -48,8 +50,9 @@ While the worker is running, the parent must NOT:
 - duplicate Luna's diagnosis or re-derive the health signals itself
 - issue ordinary corrective guidance
 - emit progress commentary or interim summaries
+- wake, poll, prompt, or otherwise participate because Luna needed another turn to finish composing a health window
 
-Luna performs every one of those jobs. Waiting on the watchdog is the parent's whole supervision duty, and waiting must never consume worker context.
+Luna performs every one of those jobs. Waiting on the watchdog is the parent's whole supervision duty, and waiting must never consume worker context. Luna needing many cheap turns to compose a health window requires no parent inference at all: the parent stays in the same native one-hour wait until Luna returns `DONE`, `NEEDS_SOL_REVIEW`, or `NEEDS_SOL_RELAY`.
 
 ### Trust a clean handoff
 
@@ -158,38 +161,44 @@ Use only:
 Loop internally:
 - Use a logical health window of 900000 ms for Qwen, 300000 ms for Ornith, or 600000 ms for an unknown local worker.
 - Build that logical window from transport-safe `wait_v1_agent` chunks of at most 225000 ms each. Chunks are quiet waits, not health-poll boundaries.
-- Compose the whole logical window inside ONE foreground Code Mode execution whose first-line yield covers the full window plus a 60000 ms completion margin. One Luna inference then covers the entire window instead of one inference per chunk. Pass the window accounting fields so the boundary is computed deterministically by the tool rather than by your own arithmetic:
+- Run exactly ONE `wait_v1_agent` chunk per Code Mode execution, and compose the logical window across as many executions and model turns as it takes. Do not try to hold one execution attached for the whole logical window: the runtime is not required to keep an execution alive that long, and needing four executions to compose a 900000 ms Qwen window is the normal, expected path. Use this invocation shape for the first chunk of a window:
 
   ```javascript
-  // @exec: {"yield_time_ms": 960000}
-  const healthWindowMs = 900000;
-  let elapsedMs = 0;
-  let foundInWindow = false;
-  let failures = 0;
-  let last = null;
-  while (elapsedMs < healthWindowMs) {
-    try {
-      last = await tools.mcp__v1_agent_watcher__wait_v1_agent({
-        thread_id: workerThreadId,
-        timeout_ms: Math.min(225000, healthWindowMs - elapsedMs),
-        health_window_ms: healthWindowMs,
-        elapsed_health_window_ms: elapsedMs,
-        found_in_health_window: foundInWindow
-      });
-    } catch (error) {
-      failures += 1;
-      last = { outcome: 'transport_failure', error: String(error) };
-      if (failures >= 3) break;
-      continue;
-    }
-    if (last.outcome !== 'timeout') break;
-    failures = 0;
-    elapsedMs = last.health_window.elapsed_ms;
-    foundInWindow = last.health_window.found_in_window;
-    if (last.health_window.inspect_now || last.health_window.missing_window) break;
-  }
-  text(JSON.stringify({ last, elapsedMs, foundInWindow, failures }));
+  // @exec: {"yield_time_ms": 240000}
+  const result = await tools.mcp__v1_agent_watcher__wait_v1_agent({
+    thread_id: "<exact-thread-id>",
+    timeout_ms: 225000,
+    health_window_ms: 900000,
+    elapsed_health_window_ms: 0,
+    found_in_health_window: false,
+    missing_health_windows: 0
+  });
+  text(JSON.stringify(result));
   ```
+
+  The 240000 ms outer yield covers the 225000 ms chunk with a deliberate 15000 ms completion margin for MCP and wrapper completion. Every individual MCP wait stays at or below 225000 ms, so no single request exceeds the transport-safe limit and no execution has to survive longer than one chunk. If the active runtime advertises a lower maximum yield, lower `timeout_ms` and the outer yield together and keep the 15000 ms margin; the accumulator credits each chunk its actual `waitedMs`, so a shorter chunk changes nothing else. A `completed` or `terminal_error` chunk returns immediately, so worker completion still wakes you early no matter which chunk of the window you are in.
+
+- Carrying the logical window across your own turns is the normal supervision path, not a fallback. The accumulator lives in the arguments you send and the fields the tool returns, never in a live execution, so state survives any number of Code Mode executions and model turns. On every chunk after the first, send back exactly what the previous result told you to send:
+
+  ```javascript
+  // @exec: {"yield_time_ms": 240000}
+  const result = await tools.mcp__v1_agent_watcher__wait_v1_agent({
+    thread_id: "<exact-thread-id>",
+    timeout_ms: 225000,
+    health_window_ms: 900000,
+    elapsed_health_window_ms: 225000,
+    found_in_health_window: true,
+    missing_health_windows: 0
+  });
+  text(JSON.stringify(result));
+  ```
+
+  Every Code Mode execution starts with a fresh scope, so no JavaScript variable survives from one chunk to the next. Write the carried values in as literals, copied from the previous chunk's `health_window.next_wait_args`. That object is a complete ready-to-send argument set: the exact `thread_id`, the next `timeout_ms`, the same `health_window_ms`, and the carried `elapsed_health_window_ms`, `found_in_health_window`, and `missing_health_windows`. The literals above are the second chunk of a Qwen window whose first chunk completed and observed the worker. `next_wait_args` already contains the post-boundary reset, so send it only after performing that chunk's `health_window.next_action`.
+
+- `health_window.next_action` names the one thing to do before the next chunk, so the boundary is never your own arithmetic:
+  - `continue_window` — the window is still accumulating. Send the next chunk immediately and do nothing else.
+  - `inspect_health` — this chunk completed the logical window and the worker was observed. Run exactly one `inspect_v1_agent_health`, act on it per the rules below, then send the next chunk.
+  - `note_missing_window` — the window completed without any chunk observing the worker. Do not inspect; check `missing_health_windows` against the escalation limit, then send the next chunk.
 
   The accumulator argument names and the returned field names are deliberately
   different. Map them exactly:
@@ -198,6 +207,7 @@ Loop internally:
   INPUT (argument you send)          OUTPUT (field the tool returns)
   elapsed_health_window_ms    <-     health_window.elapsed_ms
   found_in_health_window      <-     health_window.found_in_window
+  missing_health_windows      <-     health_window.missing_health_windows
   ```
 
   `elapsed_health_window_ms` and `found_in_health_window` are input argument
@@ -207,6 +217,7 @@ Loop internally:
   ```text
   elapsed_health_window_ms = result.health_window.elapsed_ms
   found_in_health_window   = result.health_window.found_in_window
+  missing_health_windows   = result.health_window.missing_health_windows
   ```
 
   The returned `health_window` also carries `elapsed_health_window_ms` and
@@ -217,17 +228,18 @@ Loop internally:
   logical window, so every chunk looks like the first one and
   `health_window.inspect_now` never becomes true.
 
-  Every individual MCP wait stays at or below 225000 ms, so no single request exceeds the transport-safe limit. The loop never calls `wait(cell_id)` and never creates a background cell. A `completed` or `terminal_error` chunk breaks out immediately, so worker completion still wakes the watchdog early. If the runtime rejects the full-window outer yield, fall back to exactly one 225000 ms chunk per Code Mode execution with a 240000 ms outer yield, leaving a deliberate 15000 ms completion margin, and carry `elapsed_health_window_ms` and `found_in_health_window` across your own turns using the assignment above. The inspection cadence below is identical either way.
-- Do not call `wait(cell_id)` to finish an otherwise healthy MCP chunk. An unexpected Code Mode background-cell yield is an enclosing runtime failure, not a completed MCP timeout and not evidence about worker health; return `NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached` instead of polling that cell.
+- A Code Mode execution ending between chunks is ordinary continuation, not failure. It contributes nothing to any failure count, it does not wake the parent, and it never justifies a `NEEDS_SOL_REVIEW` by itself. Read the accumulator out of the last chunk result and issue the next chunk.
+- Never end your agent turn between chunks. Do not emit a message, a status line, a healthy-chunk summary, or any other final text between waits; issue the next chunk directly. The parent is blocked in one native wait on you, and any message you finish on ends your turn and wakes it. Only the terminal lines below may end your turn.
+- Do not call `wait(cell_id)`. If a Code Mode execution unexpectedly yields a background cell (`Script running with cell ID ...`) instead of returning the chunk result, that chunk produced no observation: it contributes ZERO elapsed health-window time, says nothing about worker presence or health, and must never increment the missing-worker count. Start a fresh single-chunk execution with the accumulator values unchanged, and count that lost chunk toward the same three-attempt limit as a transport failure.
 - If `wait_v1_agent` reports `completed`, produce the completion handoff described under "Completion handoff" and return `DONE`.
 - If `wait_v1_agent` reports `terminal_error`, return exactly:
   NEEDS_SOL_REVIEW: <one concise sentence describing that observable state>
 - Only a returned `outcome: timeout` is a completed wait chunk, and only a completed chunk contributes its actual `waitedMs` to the current logical health window. A tool exception, MCP failure, transport timeout, or Code Mode yield failure contributes ZERO elapsed health-window time, says nothing about worker presence or health, and must never increment the missing-worker count.
 - A completed chunk with `found=true` immediately resets the missing-worker window count and contributes its `waitedMs` to the current logical window. It does NOT trigger a health inspection by itself. Never call inspect_v1_agent_health merely because a chunk returned.
 - Call inspect_v1_agent_health exactly once per completed logical health window, only when `health_window.inspect_now` is true — that is, only after completed timeout chunks have accumulated the full window and at least one of them observed the worker. For Qwen this means four completed 225000 ms chunks produce one inspection at 900000 ms, not four inspections.
-- After that inspection, reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false, then begin another complete window.
-- `health_window.missing_window` true means a full window completed with every chunk reporting `found=false`. Count one full missing window, reset the window accumulators, and do not inspect. Escalate only after three consecutive full missing windows.
-- Retry a failed transport chunk. If three consecutive transport/tool failures prevent observation, return `NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts`; do not describe the worker as missing or unhealthy.
+- After that inspection, reset `elapsed_health_window_ms` to 0 and `found_in_health_window` to false, then begin another complete window. The `next_wait_args` returned by the boundary chunk already carries that reset, so sending it verbatim after the inspection is correct.
+- `health_window.missing_window` true means a full window completed with every chunk reporting `found=false`. The tool has already counted it in `health_window.missing_health_windows` and already reset the window inside `next_wait_args`, so do not inspect and do not recount it yourself. Any later chunk that observes the worker clears that count. Escalate only after three consecutive full missing windows, that is only once `health_window.missing_health_windows` reaches 3.
+- Retry a failed transport chunk with the accumulator values unchanged, since a failed chunk observed nothing and changed nothing. If three consecutive transport/tool failures prevent observation, return `NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts`; do not describe the worker as missing or unhealthy. A chunk that completed normally clears the consecutive-failure count even if your turn ended before the next chunk began.
 - If state is idle/completed, produce the completion handoff and return `DONE`.
 - If health is healthy and state is running, begin another full wait. Do not report this healthy check to the parent.
 - Check the stall signals in this order and return on the first match: `post_guidance_stall`, then `post_mutation_stall`, then `progress_stall`/`pre_mutation_stall`, then any other suspicious state. A worker that stalls after guidance usually raises the earlier signals too, so checking `post_guidance_stall` first is what keeps the repeated-stall case distinguishable from the first stall, and `post_mutation_stall` must be recognized before the first-stall branch because a worker that already mutated is in a different state from one that never did.

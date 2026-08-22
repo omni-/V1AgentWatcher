@@ -74,7 +74,7 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   });
 
   const initialized = await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
-  assert.equal(initialized.result.serverInfo.version, '0.7.0');
+  assert.equal(initialized.result.serverInfo.version, '0.7.1');
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'wait_v1_agent'));
@@ -91,6 +91,10 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.ok(waitTool.inputSchema.properties.health_window_ms);
   assert.equal(waitTool.inputSchema.properties.elapsed_health_window_ms.default, 0);
   assert.equal(waitTool.inputSchema.properties.found_in_health_window.default, false);
+  // v0.7.1: the missing-worker count is accumulator state too, so it survives
+  // the watchdog turn boundaries that now compose one logical window.
+  assert.equal(waitTool.inputSchema.properties.missing_health_windows.default, 0);
+  assert.equal(waitTool.inputSchema.properties.missing_health_windows.minimum, 0);
 
   const inspected = await rpc(3, 'tools/call', {
     name: 'inspect_v1_agent_health',
@@ -134,6 +138,83 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   const timedOutText = JSON.parse(timedOut.result.content[0].text).health_window;
   assert.equal(timedOutText.elapsed_health_window_ms, timedOutText.elapsed_ms);
   assert.equal(timedOutText.found_in_health_window, timedOutText.found_in_window);
+
+  // v0.7.1: the result must carry a complete, ready-to-send argument object so
+  // the following chunk can run in a different watchdog turn without the
+  // watchdog reconstructing any accumulator state from memory.
+  assert.deepEqual(Object.keys(timedOutWindow.next_wait_args).sort(), [
+    'elapsed_health_window_ms',
+    'found_in_health_window',
+    'health_window_ms',
+    'missing_health_windows',
+    'thread_id',
+    'timeout_ms',
+  ]);
+  assert.equal(timedOutWindow.next_wait_args.thread_id, 'qwen-thread');
+  assert.equal(timedOutWindow.next_wait_args.health_window_ms, 900000);
+  assert.equal(timedOutWindow.next_wait_args.elapsed_health_window_ms, timedOutWindow.elapsed_ms);
+  assert.equal(timedOutWindow.next_wait_args.found_in_health_window, true);
+  assert.equal(timedOutWindow.next_wait_args.missing_health_windows, 0);
+  assert.equal(timedOutWindow.next_action, 'continue_window');
+  assert.equal(timedOutWindow.window_complete, false);
+
+  // Sending that object straight back is the whole cross-turn contract: the
+  // second call reaches the 900000 ms boundary and asks for one inspection.
+  const resumed = await rpc(8, 'tools/call', {
+    name: 'wait_v1_agent',
+    arguments: { ...timedOutWindow.next_wait_args, timeout_ms: 1000 },
+  });
+  const resumedWindow = resumed.result.structuredContent.health_window;
+  // The second chunk continues the same logical window rather than restarting
+  // it, which is exactly what a lost accumulator would have done.
+  assert.equal(resumedWindow.elapsed_ms > timedOutWindow.elapsed_ms, true);
+  assert.equal(resumedWindow.found_in_window, true);
+  assert.equal(resumedWindow.inspect_now, false);
+  assert.equal(resumedWindow.next_action, 'continue_window');
+  assert.equal(resumedWindow.missing_health_windows, 0);
+
+  // A chunk that does complete its logical window asks for exactly one
+  // inspection and hands back an already-reset accumulator.
+  const boundary = await rpc(10, 'tools/call', {
+    name: 'wait_v1_agent',
+    arguments: {
+      thread_id: 'qwen-thread',
+      timeout_ms: 1000,
+      health_window_ms: 1000,
+      elapsed_health_window_ms: 0,
+      found_in_health_window: false,
+      missing_health_windows: 0,
+    },
+  });
+  const boundaryWindow = boundary.result.structuredContent.health_window;
+  assert.equal(boundaryWindow.inspect_now, true);
+  assert.equal(boundaryWindow.window_complete, true);
+  assert.equal(boundaryWindow.next_action, 'inspect_health');
+  assert.equal(boundaryWindow.missing_window, false);
+  assert.equal(boundaryWindow.next_wait_args.elapsed_health_window_ms, 0);
+  assert.equal(boundaryWindow.next_wait_args.found_in_health_window, false);
+
+  // A window that completes without ever observing the worker counts once and
+  // asks for no inspection at all.
+  const unseen = await rpc(9, 'tools/call', {
+    name: 'wait_v1_agent',
+    arguments: {
+      thread_id: 'no-such-thread',
+      timeout_ms: 1000,
+      health_window_ms: 1000,
+      elapsed_health_window_ms: 0,
+      found_in_health_window: false,
+      missing_health_windows: 1,
+    },
+  });
+  const unseenWindow = unseen.result.structuredContent.health_window;
+  assert.equal(unseen.result.structuredContent.found, false);
+  assert.equal(unseenWindow.missing_window, true);
+  assert.equal(unseenWindow.inspect_now, false);
+  assert.equal(unseenWindow.next_action, 'note_missing_window');
+  assert.equal(unseenWindow.missing_health_windows, 2);
+  assert.equal(unseenWindow.next_wait_args.missing_health_windows, 2);
+  assert.equal(unseenWindow.next_wait_args.elapsed_health_window_ms, 0);
 
   await fs.appendFile(
     path.join(sessions, 'rollout-qwen.jsonl'),

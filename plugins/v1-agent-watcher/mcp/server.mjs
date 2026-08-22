@@ -19,7 +19,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.7.0' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.7.1' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -47,23 +47,29 @@ const TOOLS = [
           minimum: 1,
           maximum: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
           default: TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
-          description: 'One transport-safe wait chunk. Compose chunks in the watchdog for longer health cadences.',
+          description: 'One transport-safe wait chunk. Compose chunks in the watchdog for longer health cadences. Chunks may be issued from separate watchdog turns; the health_window accumulator carries the logical window across them.',
         },
         health_window_ms: {
           type: 'integer',
           minimum: 1,
-          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself. Read the accumulator inputs for the next call back from that returned health_window object.',
+          description: 'Optional logical health window. When supplied, the result adds deterministic health_window accounting so the watchdog never has to decide the inspection boundary itself. The accumulator is stateless, so chunks composing one logical window may run in separate watchdog turns: send the returned health_window.next_wait_args back on the following chunk.',
         },
         elapsed_health_window_ms: {
           type: 'integer',
           minimum: 0,
           default: 0,
-          description: 'Successful timeout-chunk time already accumulated in the current logical window. Carry it forward from the returned health_window.elapsed_ms (aliased as health_window.elapsed_health_window_ms). Reset to 0 after each health inspection.',
+          description: 'Successful timeout-chunk time already accumulated in the current logical window. Carry it forward from the returned health_window.next_wait_args.elapsed_health_window_ms, or equivalently from health_window.elapsed_ms (aliased as health_window.elapsed_health_window_ms) until a completed window resets it to 0.',
         },
         found_in_health_window: {
           type: 'boolean',
           default: false,
-          description: 'Whether an earlier completed chunk in the current logical window already observed the worker. Carry it forward from the returned health_window.found_in_window (aliased as health_window.found_in_health_window).',
+          description: 'Whether an earlier completed chunk in the current logical window already observed the worker. Carry it forward from the returned health_window.next_wait_args.found_in_health_window, or equivalently from health_window.found_in_window (aliased as health_window.found_in_health_window).',
+        },
+        missing_health_windows: {
+          type: 'integer',
+          minimum: 0,
+          default: 0,
+          description: 'Consecutive fully completed logical windows in which no chunk ever observed the worker. Carry it forward from the returned health_window.missing_health_windows so the count survives watchdog turn boundaries. The tool increments it only when a whole window completes unseen and clears it as soon as any chunk observes the worker.',
         },
       },
       required: ['thread_id'],
@@ -217,11 +223,15 @@ async function callTool(name, args = {}) {
         windowMs: args.health_window_ms,
         elapsedMs: args.elapsed_health_window_ms,
         foundInWindow: args.found_in_health_window,
+        missingWindows: args.missing_health_windows,
         outcome: result.outcome,
         waitedMs: result.waitedMs,
         found: result.found,
       });
-      return resultJson({ ...result, health_window: formatHealthWindow(window) });
+      return resultJson({
+        ...result,
+        health_window: formatHealthWindow(window, { threadId: args.thread_id }),
+      });
     }
     case 'inspect_v1_agent_health': {
       if (!args.thread_id && !args.nickname) {
