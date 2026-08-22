@@ -6,9 +6,11 @@ import {
   formatHealthInspection,
   formatHealthWindow,
   formatInspection,
+  formatWorkerHandoff,
   inspectAgentHealth,
   inspectAgentSession,
   listAgentSessions,
+  summarizeWorkerHandoff,
   TRANSPORT_SAFE_WAIT_TIMEOUT_MS,
   waitForAgent,
 } from './watcher.mjs';
@@ -17,7 +19,7 @@ import {
   inspectThreadUsage,
 } from './usage.mjs';
 
-const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.6.7' };
+const SERVER_INFO = { name: 'v1-agent-watcher', version: '0.7.0' };
 const TOOLS = [
   {
     name: 'list_v1_agents',
@@ -112,6 +114,23 @@ const TOOLS = [
         event_limit: { type: 'integer', minimum: 1, maximum: 100, default: 16 },
         text_limit: { type: 'integer', minimum: 80, maximum: 4000, default: 700 },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'summarize_v1_worker_handoff',
+    description: 'Build the compact structured completion handoff for one exact V1 worker thread. Returns worker status, delegated task, the worker final result, the files its persisted mutation calls named, build/test commands with their persisted outcomes, material warnings, and the watchdog intervention record. Call it once when the worker finishes so the parent can answer without rereading the worker transcript.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: { type: 'string', description: 'Exact worker thread ID.' },
+        watchdog_intervened: { type: 'boolean', default: false, description: 'Whether the watchdog sent the worker any corrective guidance during the run.' },
+        watchdog_interventions: { type: 'integer', minimum: 0, maximum: 99, default: 0, description: 'How many corrective guidance messages the watchdog sent.' },
+        watchdog_note: { type: 'string', description: 'One short sentence on why the watchdog intervened. Omit when it did not. Never a transcript, reasoning trace, or command output.' },
+        watchdog_concern: { type: 'string', description: 'One short sentence naming a concrete remaining concern for the parent. Supplying it marks the handoff materially concerning, so omit it when the run finished cleanly.' },
+        text_limit: { type: 'integer', minimum: 200, maximum: 4000, default: 1200, description: 'Character cap for the worker final-result summary.' },
+      },
+      required: ['thread_id'],
       additionalProperties: false,
     },
   },
@@ -226,6 +245,23 @@ async function callTool(name, args = {}) {
         textLimit: args.text_limit,
       });
       return resultText(formatInspection(result));
+    }
+    case 'summarize_v1_worker_handoff': {
+      const result = await summarizeWorkerHandoff({
+        threadId: args.thread_id,
+        textLimit: args.text_limit,
+        watchdog: {
+          intervened: args.watchdog_intervened,
+          interventions: args.watchdog_interventions,
+          note: args.watchdog_note,
+          concern: args.watchdog_concern,
+        },
+      });
+      if (!result) return { ...resultText(`Thread not found: ${args.thread_id}`), isError: true };
+      return {
+        content: [{ type: 'text', text: formatWorkerHandoff(result) }],
+        structuredContent: result,
+      };
     }
     case 'inspect_v1_agent_usage': {
       const result = await inspectThreadUsage({ threadId: args.thread_id });

@@ -1512,6 +1512,328 @@ export async function waitForAgent(options = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Completion handoff (v0.7.0)
+//
+// Routine supervision belongs to the cheap watchdog, so the expensive parent
+// must be able to answer from a bounded structured summary instead of replaying
+// the worker rollout. Every field below is derived from persisted rollout facts
+// so the handoff cannot grow into a second transcript, and so the watchdog is
+// never asked to author an engineering judgement it is forbidden to make.
+// ---------------------------------------------------------------------------
+
+const HANDOFF_RESULT_LIMIT = 1200;
+const HANDOFF_TASK_LIMIT = 600;
+const HANDOFF_NOTE_LIMIT = 400;
+const HANDOFF_MAX_FILES = 40;
+const HANDOFF_MAX_VERIFICATIONS = 12;
+const HANDOFF_MAX_WARNINGS = 8;
+const HANDOFF_COMMAND_LIMIT = 160;
+
+// Build/test/lint invocations. These are the calls that make a completion
+// claim checkable, and they are deliberately not investigation calls.
+const VERIFICATION_COMMAND_PATTERN = new RegExp(
+  '^(?:'
+  + '(?:npm|pnpm|yarn)\\s+(?:run\\s+\\S+|test|build|lint|typecheck|ci)'
+  + '|npx\\s+\\S+'
+  + '|node\\s+--test'
+  + '|dotnet\\s+(?:build|test)'
+  + '|pytest|tox|nox'
+  + '|python\\s+-m\\s+(?:pytest|unittest)'
+  + '|cargo\\s+(?:build|test|clippy|check)'
+  + '|go\\s+(?:build|test|vet)'
+  + '|make|mvn|gradlew?'
+  + '|jest|vitest|mocha|tsc|eslint|ruff|rspec'
+  + '|bundle\\s+exec\\s+\\S+'
+  + ')\\b',
+  'i',
+);
+
+// `apply_patch` names its files in the patch body itself. The marker is
+// authoritative, so it wins over any token scan of the same command.
+const APPLY_PATCH_FILE_PATTERN = /\*\*\*\s+(?:Add|Update|Delete|Move to)\s+File:\s*([^\s"'`]+)/gi;
+const PATH_ARGUMENT_KEYS = ['path', 'file_path', 'filePath', 'file', 'filename', 'fileName', 'target_file', 'paths', 'files'];
+
+function cleanPathToken(value) {
+  return String(value ?? '').replace(/^["'`(]+/, '').replace(/["'`),;:]+$/, '').trim();
+}
+
+function looksLikePath(token) {
+  if (!token || token.startsWith('-')) return false;
+  // A sed script and a glob both carry separators without naming one file.
+  if (/[*?]/.test(token) || /^[a-z]?\/[^/]*\//i.test(token)) return false;
+  if (!/[A-Za-z0-9]/.test(token)) return false;
+  return /[\\/]/.test(token) || /\.[A-Za-z0-9]{1,8}$/.test(token);
+}
+
+function pathsFromPatchText(value) {
+  if (typeof value !== 'string') return [];
+  const paths = [];
+  for (const match of value.matchAll(APPLY_PATCH_FILE_PATTERN)) {
+    const token = cleanPathToken(match[1]);
+    if (token) paths.push(token);
+  }
+  return paths;
+}
+
+function pathsFromArguments(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return [];
+  const paths = [];
+  for (const key of PATH_ARGUMENT_KEYS) {
+    const value = args[key];
+    if (typeof value === 'string' && cleanPathToken(value)) paths.push(cleanPathToken(value));
+    else if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry === 'string' && cleanPathToken(entry)) paths.push(cleanPathToken(entry));
+      }
+    }
+  }
+  return paths;
+}
+
+function pathsFromShellCommand(display) {
+  const text = normalizeCommandForClassification(display);
+  const patched = pathsFromPatchText(text);
+  if (patched.length) return patched;
+  return text.split(/\s+/).map(cleanPathToken).filter(looksLikePath);
+}
+
+function isVerificationCommand(display) {
+  return VERIFICATION_COMMAND_PATTERN.test(normalizeCommandForClassification(display));
+}
+
+/**
+ * Collect the deterministic facts a completion handoff needs: the delegated
+ * task, the worker's own final message, the files its mutation calls named, and
+ * the build/test commands it ran with their persisted outcomes.
+ */
+export function collectHandoffFacts(lines, options = {}) {
+  const resultLimit = clampInt(options.textLimit, 200, 4000, HANDOFF_RESULT_LIMIT);
+  const files = [];
+  const seenFiles = new Set();
+  const verification = [];
+  const verificationByCallId = new Map();
+  const failedCallIds = new Set();
+  const errors = [];
+  const seenCallIds = new Set();
+  let mutationCalls = 0;
+  let taskSummary = null;
+  let resultSummary = null;
+  let userMessages = 0;
+  let previousUserText = null;
+
+  const addFiles = (paths) => {
+    for (const candidate of paths) {
+      if (!candidate || seenFiles.has(candidate)) continue;
+      seenFiles.add(candidate);
+      files.push(candidate);
+    }
+  };
+
+  const addVerification = (callId, display) => {
+    const command = truncate(normalizeCommandForClassification(display), HANDOFF_COMMAND_LIMIT);
+    if (!command) return;
+    const entry = {
+      command,
+      outcome: callId && failedCallIds.has(callId) ? 'failed' : 'unknown',
+    };
+    verification.push(entry);
+    if (callId) verificationByCallId.set(callId, entry);
+  };
+
+  const markOutcome = (callId, failed) => {
+    if (!callId) return;
+    const entry = verificationByCallId.get(callId);
+    if (failed === true) {
+      if (entry) entry.outcome = 'failed';
+      else failedCallIds.add(callId);
+      return;
+    }
+    if (failed === false && entry && entry.outcome === 'unknown') entry.outcome = 'passed';
+  };
+
+  const addCall = (callId, display, rawPaths) => {
+    if (callId) {
+      if (seenCallIds.has(callId)) return;
+      seenCallIds.add(callId);
+    }
+    if (!display) return;
+    if (isMutationCommand(display)) {
+      mutationCalls += 1;
+      addFiles(rawPaths?.length ? rawPaths : pathsFromShellCommand(display));
+    } else if (isVerificationCommand(display)) {
+      addVerification(callId, display);
+    }
+  };
+
+  const addUserMessage = (text) => {
+    const normalized = normalizeText(text);
+    if (!normalized || ENVIRONMENT_CONTEXT_PATTERN.test(normalized)) return;
+    if (normalized === previousUserText) return;
+    previousUserText = normalized;
+    userMessages += 1;
+    if (userMessages === 1) taskSummary = truncate(normalized, HANDOFF_TASK_LIMIT);
+  };
+
+  const addAssistantMessage = (text) => {
+    const normalized = normalizeText(text);
+    if (normalized) resultSummary = truncate(normalized, resultLimit);
+  };
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    const payload = record.payload ?? {};
+    if (record.type === 'response_item') {
+      if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+        const command = commandFromCall(payload);
+        const args = parseArguments(payload.arguments ?? payload.input ?? '');
+        const paths = [
+          ...pathsFromArguments(args),
+          ...pathsFromPatchText(typeof args === 'string' ? args : args?.input ?? args?.patch ?? ''),
+        ];
+        addCall(command.callId, command.display, paths);
+      } else if (payload.type === 'local_shell_call') {
+        const action = payload.action ?? {};
+        const direct = action.command ?? action.cmd ?? action.script ?? stableStringify(action);
+        addCall(
+          payload.call_id ?? payload.id ?? null,
+          normalizeText(`shell ${Array.isArray(direct) ? direct.join(' ') : direct}`),
+          [],
+        );
+      } else if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+        markOutcome(payload.call_id ?? payload.id ?? null, explicitFailure(payload.output ?? payload.result));
+      } else if (payload.type === 'message') {
+        const text = textBlocks(payload.content).join(' ');
+        if (payload.role === 'assistant') addAssistantMessage(text);
+        else if (payload.role === 'user') addUserMessage(text);
+      }
+    } else if (record.type === 'event_msg') {
+      if (payload.type === 'exec_command_begin') {
+        const command = Array.isArray(payload.command) ? payload.command.join(' ') : payload.command;
+        addCall(payload.call_id ?? null, normalizeText(`shell ${command ?? ''}`), []);
+      } else if (payload.type === 'exec_command_end') {
+        const exitCode = payload.exit_code;
+        const failed = (exitCode !== null && exitCode !== undefined && Number(exitCode) !== 0)
+          || /^(?:failed|error|errored)$/i.test(String(payload.status ?? ''));
+        markOutcome(payload.call_id ?? null, failed);
+      } else if (payload.type === 'agent_message') {
+        addAssistantMessage(payload.message ?? payload.text);
+      } else if (payload.type === 'user_message') {
+        addUserMessage(payload.message ?? payload.text);
+      } else if (payload.type === 'error') {
+        errors.push(truncate(errorText(payload), 240));
+      } else if ((payload.type === 'task_complete' || payload.type === 'turn_complete') && payload.error) {
+        errors.push(truncate(errorText(payload.error), 240));
+      } else if (payload.type === 'turn_aborted') {
+        errors.push(truncate(`turn aborted${payload.reason ? `: ${payload.reason}` : ''}`, 240));
+      }
+    }
+  }
+
+  return {
+    taskSummary,
+    resultSummary,
+    filesChanged: files.slice(0, HANDOFF_MAX_FILES),
+    filesChangedTotal: files.length,
+    verification: verification.slice(-HANDOFF_MAX_VERIFICATIONS),
+    verificationTotal: verification.length,
+    mutationCalls,
+    errors: errors.slice(-HANDOFF_MAX_WARNINGS),
+  };
+}
+
+/**
+ * Assemble the parent-facing handoff. `material_concern` is what tells the
+ * parent whether any independent inspection is justified at all, so it stays
+ * narrow: a non-clean terminal state, a persisted error, a failed verification,
+ * a suspicious health screen, or a concern the watchdog states explicitly.
+ */
+export function buildWorkerHandoff(options = {}) {
+  const facts = options.facts ?? collectHandoffFacts([]);
+  const health = options.health ?? null;
+  const watchdog = options.watchdog ?? {};
+  const state = options.state ?? health?.state ?? 'unknown';
+  const status = state === 'idle' ? 'completed' : state;
+  const warnings = [];
+
+  if (status !== 'completed') warnings.push(`worker_status: rollout state is ${status}, not a completed turn`);
+  for (const error of facts.errors) warnings.push(`worker_error: ${error}`);
+  const failedVerification = facts.verification.filter((entry) => entry.outcome === 'failed');
+  for (const entry of failedVerification) warnings.push(`verification_failed: ${entry.command}`);
+  if (!facts.verification.length) warnings.push('verification_missing: no persisted build/test command in this rollout');
+  if (!facts.mutationCalls) warnings.push('no_mutation: no persisted repository-mutation call in this rollout');
+  for (const signal of health?.signals ?? []) warnings.push(`health_signal: ${signal}`);
+  const watchdogConcern = truncate(watchdog.concern ?? '', HANDOFF_NOTE_LIMIT);
+  if (watchdogConcern) warnings.push(`watchdog_concern: ${watchdogConcern}`);
+
+  const interventions = clampInt(watchdog.interventions, 0, 99, 0);
+  const intervened = watchdog.intervened === true || interventions > 0;
+  const materialConcern = status !== 'completed'
+    || facts.errors.length > 0
+    || failedVerification.length > 0
+    || Boolean(watchdogConcern)
+    || health?.health === 'suspicious';
+
+  return {
+    worker_thread_id: options.threadId ?? null,
+    worker_status: status,
+    task_summary: facts.taskSummary,
+    result_summary: facts.resultSummary,
+    files_changed: facts.filesChanged,
+    files_changed_truncated: facts.filesChangedTotal > facts.filesChanged.length,
+    verification: facts.verification,
+    verification_performed: facts.verification.length > 0,
+    warnings: warnings.slice(0, HANDOFF_MAX_WARNINGS),
+    watchdog: {
+      intervened,
+      interventions,
+      note: truncate(watchdog.note ?? '', HANDOFF_NOTE_LIMIT) || null,
+      concern: watchdogConcern || null,
+    },
+    material_concern: materialConcern,
+    parent_action: materialConcern ? 'review_concern' : 'use_handoff',
+  };
+}
+
+export async function summarizeWorkerHandoff(options = {}) {
+  const agent = await resolveAgent(options);
+  if (!agent) return null;
+
+  let recent;
+  try {
+    recent = await readRecentRollout(agent.filePath, options.maxReadBytes);
+  } catch {
+    return buildWorkerHandoff({
+      threadId: options.threadId ?? agent.threadId,
+      state: 'unreadable',
+      facts: collectHandoffFacts([]),
+      watchdog: options.watchdog,
+    });
+  }
+
+  const health = await inspectResolvedAgentHealth(agent, options);
+  const facts = collectHandoffFacts(recent.lines, { textLimit: options.textLimit });
+  return buildWorkerHandoff({
+    threadId: agent.threadId,
+    state: health?.state,
+    health,
+    facts,
+    watchdog: options.watchdog,
+  });
+}
+
+export function formatWorkerHandoff(handoff) {
+  if (!handoff) return 'No matching V1 collaboration child-agent rollout session found.';
+  return JSON.stringify(handoff, null, 2);
+}
+
 export function formatAgentList(agents) {
   if (!agents.length) return 'No V1 collaboration child-agent rollout sessions found.';
   return agents.map((agent, index) => {

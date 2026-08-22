@@ -38,7 +38,10 @@ test('the health-window contract inspects once per completed logical window', as
 test('a first progress stall continues the same worker and a repeated stall may replace it', async () => {
   const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
 
-  assert.match(skill, /NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation/);
+  // The watchdog now owns the first stall, so it corrects the worker itself
+  // instead of returning a parent escalation for it.
+  assert.match(skill, /signals include `progress_stall` or `pre_mutation_stall`, intervene yourself using the first-stall continuation below/);
+  assert.equal(/NEEDS_SOL_REVIEW: worker appears active but has stalled before implementation/.test(skill), false);
   assert.match(skill, /never justifies killing a live worker by itself/);
   assert.match(skill, /send ONE focused continuation to the SAME worker through `send_input` with `interrupt=false`/);
   assert.match(skill, /Stop investigating\. Use the diagnosis and implementation plan you already established\./);
@@ -142,7 +145,10 @@ test('the watchdog recognizes the post-mutation stall between the guidance and f
   assert.ok(postGuidance < postMutation, 'post_guidance_stall must be checked first');
   assert.ok(postMutation < firstStall, 'post_mutation_stall must be checked before the first-stall branch');
   assert.match(skill, /`post_guidance_stall`, then\s+`post_mutation_stall`, then `progress_stall`\/`pre_mutation_stall`/);
-  assert.match(skill, /NEEDS_SOL_REVIEW: worker changed the repository but has spent too long investigating without further mutation/);
+  // The post-mutation stall is watchdog-owned intervention in v0.7.0, not a
+  // parent escalation, while the post-guidance stall still wakes the parent.
+  assert.match(skill, /signals include `post_mutation_stall`, intervene yourself using the post-mutation continuation below/);
+  assert.equal(/NEEDS_SOL_REVIEW: worker changed the repository but has spent too long investigating without further mutation/.test(skill), false);
 });
 
 test('the contract documents the post-mutation stall thresholds and its newest-mutation reset', async () => {
@@ -164,13 +170,13 @@ test('a first post-mutation stall keeps the same worker and only a later post-gu
 
   assert.match(skill, /### First post-mutation stall: continue the same worker/);
   // Earlier guidance plus a successful mutation is not "ignored guidance".
-  assert.match(skill, /A `post_mutation_stall` is not the repeated-stall case, even when the parent has already sent guidance earlier in the run/);
-  assert.match(skill, /does not mean the worker ignored parent guidance, and it does not enter the replacement path/);
+  assert.match(skill, /A `post_mutation_stall` is not the repeated-stall case, even when guidance has already been sent earlier in the run/);
+  assert.match(skill, /does not mean the worker ignored that guidance, and it does not enter the replacement path/);
   assert.match(skill, /Preserve the implementation you already made\./);
   assert.match(skill, /Stop expanding into adjacent approaches or validation infrastructure\./);
   assert.match(skill, /Run the narrowest existing build\/tests that apply, then finish and report\./);
   const section = skill.slice(skill.indexOf('### First post-mutation stall'), skill.indexOf('### Repeated progress stall after guidance'));
-  assert.match(section, /Do not replace the worker and do not spawn a second worker/);
+  assert.match(section, /Do not replace the worker and do not spawn a second worker, and do not wake the parent for this/);
   assert.match(section, /first guidance -> mutation -> `post_mutation_stall` does not justify replacement/);
   assert.match(section, /`post_mutation_stall` -> focused continuation -> `post_guidance_stall` may/);
   // The continuation must stay generic rather than naming a framework.
@@ -192,4 +198,80 @@ test('the contract separates health-window input argument names from returned fi
   // The canonical loop keeps reading the canonical fields.
   assert.match(skill, /elapsedMs = last\.health_window\.elapsed_ms;/);
   assert.match(skill, /foundInWindow = last\.health_window\.found_in_window;/);
+});
+
+test('the parent delegates routine supervision and never polls the worker', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /## Parent responsibilities/);
+  assert.match(skill, /While the worker is running, the parent must NOT:/);
+  assert.match(skill, /- inspect the Qwen thread or read intermediate worker transcript/);
+  assert.match(skill, /- poll Qwen progress or periodically check whether the worker is still alive/);
+  assert.match(skill, /- duplicate Luna's diagnosis or re-derive the health signals itself/);
+  assert.match(skill, /- issue ordinary corrective guidance/);
+  assert.match(skill, /Waiting on the watchdog is the parent's whole supervision duty/);
+  // Luna, not the parent, owns every routine observation of the worker.
+  assert.match(skill, /Luna owns routine supervision for the whole run/);
+  assert.match(skill, /keeps Luna the sole routine observer of the worker/);
+});
+
+test('a clean handoff tells the parent not to re-inspect the worker or the repository', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /If the watchdog reports successful completion with no material concern, use its handoff and the worker's final result to answer the user\. Do not independently re-inspect the worker transcript or repository merely to reconfirm routine work\./);
+  assert.match(skill, /`use_handoff` — nothing in the persisted run warrants parent inspection/);
+  assert.match(skill, /`review_concern` — the handoff carries at least one material warning\. Inspect only what is needed to resolve that specific concern/);
+  assert.match(skill, /A `warnings` entry is a reason to look at one thing, not a reason to replay the run/);
+  // The old contract told the parent to review the worker's changes on every
+  // DONE. That routine re-review is exactly what v0.7.0 removes.
+  assert.equal(/After `DONE`, the parent reviews the worker's final changes normally/.test(skill), false);
+});
+
+test('completion produces exactly one compact tool-built handoff', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /Call `summarize_v1_worker_handoff` exactly once/);
+  assert.match(skill, /Return the line `DONE: worker completed` followed by that tool's JSON result verbatim/);
+  assert.match(skill, /Never include a chronological account, reasoning trace, long command output, worker transcript, or your own engineering assessment/);
+  assert.match(skill, /## Completion handoff/);
+  assert.match(skill, /`material_concern: false` and `parent_action: "use_handoff"`/);
+  assert.match(skill, /the handoff cannot grow into a second transcript/);
+});
+
+test('the watchdog sends ordinary corrective guidance itself', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /## Watchdog intervention/);
+  assert.match(skill, /Ordinary corrective guidance is the watchdog's job, not the parent's/);
+  assert.match(skill, /`send_input` with `interrupt=false` targeting that exact thread, ONLY to deliver one of the fixed continuation texts below/);
+  // Both existing continuation texts survive, now owned by Luna.
+  assert.match(skill, /Stop investigating\. Use the diagnosis and implementation plan you already established\./);
+  assert.match(skill, /Preserve the implementation you already made\./);
+  // The cheap model must never invent technical instruction of its own.
+  assert.match(skill, /The continuation texts below are fixed\. Send one verbatim\./);
+  assert.match(skill, /Never author your own technical instruction, diagnosis, or fix/);
+  assert.match(skill, /Send at most one continuation per stall class, and at most two continuations in the whole run/);
+});
+
+test('escalation stays available for exceptional cases only', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /NEEDS_SOL_REVIEW: worker resumed investigating after parent guidance without mutating the repository/);
+  assert.match(skill, /NEEDS_SOL_REVIEW: worker remains materially stuck after watchdog guidance/);
+  assert.match(skill, /NEEDS_SOL_REVIEW: <one concise sentence naming the decision the parent must make>/);
+  assert.match(skill, /NEEDS_SOL_REVIEW: watchdog transport unavailable after three attempts/);
+  assert.match(skill, /NEEDS_SOL_REVIEW: watchdog Code Mode execution could not remain attached/);
+  // Replacement remains a parent decision after guidance was already ignored.
+  assert.match(skill, /replacement becomes justified, and replacement is a parent decision/);
+  assert.match(skill, /The parent then closes that worker and spawns a replacement/);
+});
+
+test('the relay path keeps the parent out of diagnosis when sibling send_input is unavailable', async () => {
+  const skill = await fs.readFile(path.join(pluginRoot, 'skills', 'supervise-v1-agent', 'SKILL.md'), 'utf8');
+
+  assert.match(skill, /## Sibling guidance delivery/);
+  assert.match(skill, /V1 does not document sibling `send_input` as ownership-free/);
+  assert.match(skill, /NEEDS_SOL_RELAY: <the exact continuation text, verbatim>/);
+  assert.match(skill, /delivers exactly that text through `send_input` with `interrupt=false` and re-enters the same one-hour watchdog wait without inspecting the worker/);
+  assert.match(skill, /`NEEDS_SOL_RELAY` is not a review request/);
 });

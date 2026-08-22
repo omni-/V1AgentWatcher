@@ -74,12 +74,17 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   });
 
   const initialized = await rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
-  assert.equal(initialized.result.serverInfo.version, '0.6.7');
+  assert.equal(initialized.result.serverInfo.version, '0.7.0');
   const listed = await rpc(2, 'tools/list');
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_health'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'wait_v1_agent'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_agent_usage'));
   assert.ok(listed.result.tools.some((tool) => tool.name === 'inspect_v1_supervision_usage'));
+  assert.ok(listed.result.tools.some((tool) => tool.name === 'summarize_v1_worker_handoff'));
+  const handoffTool = listed.result.tools.find((tool) => tool.name === 'summarize_v1_worker_handoff');
+  assert.deepEqual(handoffTool.inputSchema.required, ['thread_id']);
+  assert.equal(handoffTool.inputSchema.properties.watchdog_interventions.default, 0);
+  assert.equal(handoffTool.inputSchema.properties.text_limit.maximum, 4000);
   const waitTool = listed.result.tools.find((tool) => tool.name === 'wait_v1_agent');
   assert.equal(waitTool.inputSchema.properties.timeout_ms.maximum, 225000);
   assert.equal(waitTool.inputSchema.properties.timeout_ms.default, 225000);
@@ -174,4 +179,31 @@ test('MCP exposes compact deterministic health inspection', async (t) => {
   assert.equal(accounting.thread, 'qwen-thread');
   assert.equal(accounting.cumulative.effective_tokens, 80);
   assert.equal(usage.result.structuredContent.thread, 'qwen-thread');
+
+  // v0.7.0: one compact handoff replaces the parent rereading the worker.
+  const handoff = await rpc(8, 'tools/call', {
+    name: 'summarize_v1_worker_handoff',
+    arguments: { thread_id: 'qwen-thread' },
+  });
+  assert.equal(handoff.result.isError, undefined);
+  const summary = handoff.result.structuredContent;
+  assert.equal(summary.worker_thread_id, 'qwen-thread');
+  assert.equal(summary.worker_status, 'completed');
+  assert.equal(summary.material_concern, false);
+  assert.equal(summary.parent_action, 'use_handoff');
+  assert.equal(summary.watchdog.intervened, false);
+  assert.equal(summary.watchdog.interventions, 0);
+  assert.deepEqual(summary.files_changed, []);
+  // The text content must carry the same handoff for a Code Mode client that
+  // parses content instead of structuredContent.
+  assert.deepEqual(JSON.parse(handoff.result.content[0].text), summary);
+  // A handoff is a summary, not a transcript: no event stream is exposed.
+  assert.equal('events' in summary, false);
+  assert.equal('recent_summary' in summary, false);
+
+  const missingHandoff = await rpc(9, 'tools/call', {
+    name: 'summarize_v1_worker_handoff',
+    arguments: { thread_id: 'no-such-thread' },
+  });
+  assert.equal(missingHandoff.result.isError, true);
 });
